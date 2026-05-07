@@ -10,7 +10,7 @@ As demand for on-cloud Large Language Models (LLMs) explodes, the high inference
 ![Framework](docs/framework.png)
 
 ---
-
+![UI example](docs/UI_example.gif)
 ## Getting Started
 
 AutoDraft is an **adaptive tree-based user-cloud distributed speculative decoding** framework. It consists of two cooperating processes:
@@ -165,7 +165,6 @@ Starting from the registered server, select in this order:
 4. Pick quantization (4bit / 8bit) under `Server Q` / `Draft Q`.
 5. Click `Start` to launch the runtime, then send a message.
 
-![UI example](docs/UI_example.gif)
 ---
 
 ## 3. Configure runs via an XML file
