@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autodraft-sd"
+version = "1.0.2"
+description = "Speculative decoding engine with local and remote target model execution"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "AutoDraft Authors", email = "autodraft2626@gmail.com" }
+]
+keywords = ["speculative-decoding", "llm", "inference", "autodraft"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Heavy deps required by the in-wheel runtime (evaluation/, opt_classic/).
+# torch must be installed separately for non-default CUDA targets — see
+# README §8-5 for installing the matching cu1xx wheel before pip-installing
+# autodraft. Everything else (including bitsandbytes for 4/8-bit quant and
+# matplotlib for the trade-off PNG) is in the base deps so a single
+# ``pip install autodraft-sd`` covers all real workflows. There is no
+# ``[quant]`` / ``[plot]`` extra anymore — the library is GPU-bound, so
+# splitting hairs over a few MB doesn't help anyone.
+dependencies = [
+  "torch",
+  "transformers",
+  "accelerate",
+  # ``fschat`` is the lmsys FastChat distribution that registers itself as
+  # the ``fastchat`` Python module. The runtime imports
+  # ``fastchat.llm_judge.common.load_questions`` at module load, which
+  # requires fschat's ``llm_judge`` extra (pulls openai<1, anthropic, ray
+  # transitively). The unrelated ``fastchat`` PyPI distribution does NOT
+  # provide ``fastchat.llm_judge`` and must not be used.
+  "fschat[llm_judge]",
+  "shortuuid",
+  "tqdm",
+  "datasets",
+  "numpy",
+  "psutil",
+  "nvidia-ml-py",
+  "safetensors",
+  "bitsandbytes",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "ruff",
+  "build",
+  "twine",
+]
+
+[project.urls]
+Homepage = "https://github.com/autodraft26/AutoDraft2026"
+Repository = "https://github.com/autodraft26/AutoDraft2026"
+Issues = "https://github.com/autodraft26/AutoDraft2026/issues"
+
+# Ship the autodraft wrapper plus the speculative-decoding runtime
+# (evaluation/, opt_classic/) so ``pip install autodraft-sd`` is fully
+# functional without a source checkout. Distribution name is
+# ``autodraft-sd`` because ``autodraft`` is already taken on PyPI; the
+# Python import name stays ``autodraft``. Research-only assets (chat_ui,
+# data, result, analysis, tools, scripts, demos, the FastAPI UI, the
+# alternate eagle pipeline) are intentionally excluded.
+# PEP 561 marker so type checkers (Pylance / Pyright / mypy) treat the
+# package as typed and surface hover docstrings in IDEs.
+[tool.setuptools.package-data]
+autodraft = ["py.typed"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "autodraft*",
+  "evaluation*",
+  "opt_classic*",
+]
+exclude = [
+  "tests*",
+  "examples*",
+  "opt_eagle*",
+  "chat_ui*",
+  "data*",
+  "result*",
+  "analysis*",
+  "tools*",
+  "scripts*",
+  "venv*",
+  "demo*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]

@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<experiment_config>
+  <!-- Example for overall performance on MT-bench with the total-cost objective.
+       The <objective> block below is the canonical place to study which cost
+       knobs matter for which objective_metric — every supported cost model is
+       laid out as an explicit XML tag so users can edit it directly here
+       instead of digging into a CSV. -->
+
+  <runtime>
+    <TARGET_HOST>192.168.0.12</TARGET_HOST>
+    <TARGET_PORT>26001</TARGET_PORT>
+    <DEVICE_MAP>cuda:0</DEVICE_MAP>
+    <DRAFT_DEVICE_NAME>rtx5080</DRAFT_DEVICE_NAME>
+    <SERVER_NAME>rtxproa6000</SERVER_NAME>
+  </runtime>
+
+  <models>
+    <BASE_MODEL_PATH>Qwen/Qwen2.5-14B-Instruct</BASE_MODEL_PATH>
+    <DRAFT_MODEL_PATH>Qwen/Qwen2.5-1.5B-Instruct</DRAFT_MODEL_PATH>
+    <TARGET_QUANTIZATION>none</TARGET_QUANTIZATION>
+    <DRAFT_QUANTIZATION>none</DRAFT_QUANTIZATION>
+  </models>
+
+  <objective>
+    <!-- =========================================================================
+         Cost objective. Pick one (comma-separated for sweeps).
+           - total_cost     : draft GPU $ + target GPU $ + electricity + comm
+           - api_cost       : target API $/hr only (use when target is hosted API)
+           - draft_energy   : draft GPU kWh only (user-device side)
+           - target_energy  : target GPU kWh only (cloud side)
+         ========================================================================= -->
+    <OBJECTIVE_METRICS_CSV>total_cost</OBJECTIVE_METRICS_CSV>
+
+    <!-- cost-sensitivity sweep: 0 = TPS-first, 1 = cost-first.
+         Single value = single run; space-separated = sweep multiple cs points. -->
+    <AUTODRAFT_CS_LIST>0</AUTODRAFT_CS_LIST>
+
+    <!-- =========================================================================
+         Cost-model parameters (in $). Each is consumed only by the objectives
+         listed in the trailing comment. For draft_energy / target_energy
+         objectives, every $-denominated knob below is ignored —
+         energy is measured directly by NVML on the respective GPU.
+
+         Note on the user-device (draft) GPU cost: total_cost computes it from
+         measured kWh × DRAFT_ELECTRICITY_COST_PER_KWH (not from an $/h rate),
+         which is why there is no DRAFT_PER_HOUR_COST knob in this list.
+         ========================================================================= -->
+    <TARGET_PER_HOUR_COST>1.208</TARGET_PER_HOUR_COST>
+    <!--      ↑ $/hour for the cloud (target) GPU or API.
+                 used by: total_cost, api_cost
+                 default: 1.208 (≈ A100 spot price) -->
+
+    <DRAFT_ELECTRICITY_COST_PER_KWH>0.2</DRAFT_ELECTRICITY_COST_PER_KWH>
+    <!--      ↑ $/kWh user-side electricity rate. Multiplied by the kWh that
+                 NVML measures on the draft GPU to bill the user-device side.
+                 used by: total_cost
+                 default: 0.2 -->
+
+    <USER_COMM_COST_PER_GB>0.33</USER_COMM_COST_PER_GB>
+    <!--      ↑ $/GB user-side network egress (user → cloud).
+                 used by: total_cost
+                 default: 0.33 -->
+
+    <CLOUD_OUTBOUND_COST_PER_GB>0.09</CLOUD_OUTBOUND_COST_PER_GB>
+    <!--      ↑ $/GB cloud-side outbound (cloud → user).
+                 used by: total_cost
+                 default: 0.09 -->
+  </objective>
+
+  <dataset>
+    <BENCHES_CSV>mt_bench</BENCHES_CSV>
+  </dataset>
+
+  <algorithms>
+    <ENABLE_HYBRID_AUTODRAFT>1</ENABLE_HYBRID_AUTODRAFT>
+  </algorithms>
+
+  <tree>
+    <!-- Hybrid AutoDraft uses these as nodes and max_depth. -->
+    <PROPOSED_NODES>150</PROPOSED_NODES>
+    <PROPOSED_MAX_DEPTH>15</PROPOSED_MAX_DEPTH>
+    <!-- Hybrid AutoDraft draft-model profile width candidates. Keep this covering the tree node budget. -->
+    <DRAFT_PROFILE_WIDTH_LIST>10,20,30,40,50,60,70,80,90,100,110,120,130,140,150</DRAFT_PROFILE_WIDTH_LIST>
+    <!-- Target profile uses fixed width=50 and depth=10 in draft.py; this node list should cover PROPOSED_NODES. -->
+    <TARGET_PROFILE_NODE_LIST>10,20,30,40,50,60,70,80,90,100,110,120,130,140,150</TARGET_PROFILE_NODE_LIST>
+    <TARGET_PROFILE_MODEL_CALLS_PER_COUNT>10</TARGET_PROFILE_MODEL_CALLS_PER_COUNT>
+  </tree>
+
+</experiment_config>

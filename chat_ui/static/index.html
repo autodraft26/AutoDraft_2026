@@ -1,0 +1,292 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Chat UI</title>
+  <link rel="stylesheet" href="/static/style.css?v=48" />
+</head>
+<body>
+  <div class="page">
+    <div class="top-strip">
+      <div class="top-controls">
+        <div class="top-grid two model-grid">
+          <div class="field server-field">
+            <div class="panel-title-row">
+              <div class="panel-title">Server</div>
+              <div class="row-btns">
+                <button id="serverSetKeyBtn" class="mini-btn" type="button">Set Key</button>
+                <button id="serverAddToggleBtn" class="mini-btn" type="button">Add Server</button>
+              </div>
+            </div>
+            <div id="serverDropdown" class="server-dropdown">
+              <button id="serverDropdownBtn" class="panel-select server-dropdown-btn" type="button">No server</button>
+              <div id="serverDropdownMenu" class="server-dropdown-menu hidden"></div>
+            </div>
+            <select id="serverSelect" class="panel-select hidden-native-select" aria-hidden="true" tabindex="-1"></select>
+            <div id="serverModeHint" class="constraint-hint">Mode: -</div>
+          </div>
+          <div class="field">
+            <div class="panel-title-row">
+              <div class="panel-title">Server Model</div>
+              <select id="serverQuantizationSelect" class="panel-select inline-select-small">
+                <option value="none" selected>Server Q: None</option>
+                <option value="8bit">Server Q: 8-bit</option>
+                <option value="4bit">Server Q: 4-bit</option>
+              </select>
+            </div>
+            <select id="serverModelSelect" class="panel-select"></select>
+          </div>
+          <div class="field draft-field">
+            <div class="panel-title-row">
+              <div class="panel-title">Draft Model</div>
+              <select id="draftQuantizationSelect" class="panel-select inline-select-small">
+                <option value="none" selected>Draft Q: None</option>
+                <option value="8bit">Draft Q: 8-bit</option>
+                <option value="4bit">Draft Q: 4-bit</option>
+              </select>
+            </div>
+            <select id="draftModelSelect" class="panel-select">
+              <option value="meta-llama/Llama-3.2-1B-Instruct">Meta Llama 3.2 1B Instruct</option>
+              <option value="meta-llama/Llama-3.2-3B-Instruct">Meta Llama 3.2 3B Instruct</option>
+              <option value="Qwen/Qwen2.5-0.5B-Instruct">Qwen2.5 0.5B Instruct</option>
+              <option value="Qwen/Qwen2.5-1.5B-Instruct">Qwen2.5 1.5B Instruct</option>
+              <option value="Qwen/Qwen2.5-3B-Instruct">Qwen2.5 3B Instruct</option>
+              <option value="Qwen/Qwen3-0.6B">Qwen3 0.6B</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="top-grid three">
+          <div class="field">
+            <div class="panel-title">Algorithm</div>
+            <select id="algorithmSelect" class="panel-select">
+              <option value="AutoDraft">AutoDraft</option>
+              <option value="Server-Only">Server-Only SD</option>
+              <option value="Server-Only-AR">Server-Only AR</option>
+              <option value="OPT-Tree">OPT-Tree</option>
+              <option value="Fixed-tree">Fixed-tree</option>
+            </select>
+            <div class="panel-title checkbox-title" style="margin-top:8px;">
+              Proactive Drafting
+              <input id="proactiveDrafting" type="checkbox" />
+            </div>
+          </div>
+          <div class="field">
+            <div class="panel-title">Mode</div>
+            <select id="modeSelect" class="panel-select">
+              <option value="benchmark">Benchmark</option>
+              <option value="chat" selected>Chat</option>
+            </select>
+            <div class="panel-title" style="margin-top:8px;">Dataset</div>
+            <select id="benchmarkDatasetSelect" class="panel-select">
+              <option value="mt_bench" selected>mt_bench</option>
+              <option value="gsm8k">gsm8k</option>
+              <option value="humaneval">humaneval</option>
+              <option value="cnn_dailymail">cnn_dailymail</option>
+            </select>
+          </div>
+          <div class="field">
+            <div class="panel-title">Max New Tokens</div>
+            <input id="maxTokensInput" class="panel-select" type="number" min="1" max="4096" step="1" value="512" />
+          </div>
+        </div>
+
+        <div class="top-grid two">
+          <div class="field">
+            <div class="panel-title">Objective Selection</div>
+            <select id="objectiveModeSelect" class="panel-select narrow-select">
+              <option value="balanced" selected>Balanced (blend)</option>
+              <option value="constraint">Constraint</option>
+            </select>
+          </div>
+          <div class="field">
+            <div class="panel-title">Metric Preference</div>
+            <select id="metricPreferenceSelect" class="panel-select narrow-select">
+              <option value="total_cost" selected>Total Cost (Draft + Target + Comm / 1M)</option>
+              <option value="api_cost">API Cost (Target Only / 1M)</option>
+              <option value="draft_energy">Draft Energy Only</option>
+              <option value="target_energy">Target Energy Only</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="top-grid two">
+          <div class="field" id="costControlGroup">
+            <div class="panel-title">Cost Sensitivity</div>
+            <div class="slider-row narrow-slider-row">
+              <input id="costSlider" type="range" min="0" max="1" step="0.01" value="0.15" />
+              <div id="costValue" class="cost-value">0.15</div>
+            </div>
+          </div>
+          <div class="field" id="constraintTargetControlGroup" style="display:none;">
+            <div class="panel-title">Constraint Target</div>
+            <select id="constraintTargetSelect">
+              <option value="metric">Metric Budget</option>
+              <option value="tps">Minimum Throughput</option>
+            </select>
+          </div>
+          <div class="field" id="constraintControlGroup" style="display:none;">
+            <div class="panel-title">Constraint [$ / 1M tok]</div>
+            <div class="slider-row narrow-slider-row">
+              <input id="constraintSlider" type="range" min="1" max="30" step="0.1" value="14.0" />
+              <div id="constraintValue" class="cost-value">14.0</div>
+            </div>
+            <div id="constraintHint" class="constraint-hint">Feasible range loading...</div>
+          </div>
+          <div class="field" id="tpsConstraintControlGroup" style="display:none;">
+            <div class="panel-title">Min Throughput [tok/s]</div>
+            <div class="slider-row narrow-slider-row">
+              <input id="tpsConstraintSlider" type="range" min="0" max="100" step="0.5" value="0.0" />
+              <div id="tpsConstraintValue" class="cost-value">0.0</div>
+            </div>
+            <div id="tpsConstraintHint" class="constraint-hint">0 disables the TPS floor.</div>
+          </div>
+          <div class="field">
+            <div class="panel-title-row">
+              <div class="panel-title">Control</div>
+              <span id="sessionBadge" class="status-badge idle">Idle</span>
+            </div>
+            <div class="control-row control-row-3buttons">
+              <button id="startBtn" class="control-btn">Start</button>
+              <button id="stopBtn" class="control-btn danger">Stop</button>
+              <button id="shutdownTargetBtn" class="control-btn danger" type="button">Shutdown</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="top-tradeoff">
+        <div class="panel-title-row">
+          <div class="panel-title">Selectable Trade-off</div>
+          <div class="row-btns">
+            <button id="refreshReferenceBtn" class="mini-btn">
+              Profile LLM
+              <span class="btn-help" data-tooltip="Profiles the currently selected LLM setup and updates the reference trade-off curve for the selected objective mode.">
+                ?
+              </span>
+            </button>
+            <button id="refreshReferenceDetailedBtn" class="mini-btn">
+              Profile LLM (Detailed)
+              <span class="btn-help" data-tooltip="Re-profiles target latency with 5-step nodes (10~150), then rebuilds reference. Use when you need finer profiling detail.">
+                ?
+              </span>
+            </button>
+            <button id="probeBtn" class="mini-btn">
+              Profile Servers
+              <span class="btn-help" data-tooltip="Shows Profile LLM results for all servers in one graph. Uses active runtime/cache first, then probes only when no reference is available.">
+                ?
+              </span>
+            </button>
+          </div>
+        </div>
+        <canvas id="tradeoffCanvas" class="tradeoff-canvas"></canvas>
+        <div id="recommendationBadges" class="recommendation-badges">
+          <button id="jumpBestEfficiencyBtn" class="mini-btn">Best Efficiency</button>
+          <button id="jumpParetoBtn" class="mini-btn">Pareto-Optimal</button>
+          <button id="jumpFastestBtn" class="mini-btn">Fastest</button>
+        </div>
+        <div id="tradeoffHint" class="constraint-hint">Click on graph to select.</div>
+      </div>
+    </div>
+
+    <div class="chat-shell">
+      <div class="chat-toolbar">
+        <button id="howToUseBtn" class="mini-btn" type="button">How to use?</button>
+        <label class="checkbox-title">
+          Token Source Coloring
+          <input id="tokenColoringToggle" type="checkbox" />
+        </label>
+      </div>
+      <div id="floatingActionHost" class="floating-action-host hidden">
+        <div id="serverKeyPopup" class="floating-card hidden">
+          <div class="panel-title-row">
+            <div class="panel-title">Set API Key</div>
+            <button id="closeServerKeyPopupBtn" class="mini-btn" type="button">Close</button>
+          </div>
+          <div class="control-row" style="margin-top:8px;">
+            <input id="selectedServerApiKey" class="panel-select" type="password" placeholder="API Key for selected server" />
+            <button id="updateServerKeyBtn" class="control-btn">Apply</button>
+          </div>
+        </div>
+
+        <div id="addServerPanel" class="floating-card hidden">
+          <div class="panel-title-row">
+            <div class="panel-title">
+              Add Server (Manual)
+              <span class="btn-help" data-tooltip="Add a AutoDraft target socket server with server name, IP address, and port.">
+                ?
+              </span>
+            </div>
+            <button id="closeAddServerPopupBtn" class="mini-btn" type="button">Close</button>
+          </div>
+          <div class="server-form-grid">
+            <input id="newServerName" class="panel-select" type="text" placeholder="Server Name" />
+            <input id="newServerHost" class="panel-select" type="text" placeholder="IP Address (e.g. 192.168.0.12)" />
+            <div class="add-server-inline-row">
+              <input id="newServerPort" class="panel-select" type="number" min="1" max="65535" step="1" placeholder="Port (e.g. 26001)" />
+              <button id="addServerBtn" class="control-btn" type="button">Add Server</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div id="messages" class="messages"></div>
+      <div class="composer">
+        <div class="hint">How can I help you?</div>
+        <div id="activityBanner" class="activity-banner idle">Idle</div>
+        <div class="input-row">
+          <textarea id="input" rows="1" placeholder="Ask anything"></textarea>
+          <button id="send" title="Send">▶</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="right-panel">
+      <div class="settings-grid">
+        <div id="recommendationHint" class="constraint-hint" style="display:none;">Run profiling to compute recommendations.</div>
+
+        <div class="field full">
+          <div class="panel-title">Stats</div>
+          <div class="stats-container">
+            <div class="stat-item">
+              <div class="stat-label">Draft Energy [kWh / 1M tok]</div>
+              <canvas id="gpuEnergyChart" class="stat-chart"></canvas>
+            </div>
+            <div class="stat-item">
+              <div class="stat-label">Draft Cost [$ / 1M tok]</div>
+              <canvas id="draftCostChart" class="stat-chart"></canvas>
+            </div>
+            <div class="stat-item">
+              <div class="stat-label">Target Cost [$ / 1M tok]</div>
+              <canvas id="targetCostChart" class="stat-chart"></canvas>
+            </div>
+            <div class="stat-item">
+              <div class="stat-label">Throughput [Token / sec]</div>
+              <canvas id="throughputChart" class="stat-chart"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <div class="field full">
+          <div class="panel-title">Current Tree (Step)</div>
+          <canvas id="treeMiniCanvas" class="tree-mini-canvas"></canvas>
+          <div id="treeMiniBox" class="tree-mini-box">-</div>
+        </div>
+
+        <div class="field full">
+          <div class="panel-title">Diagnostics</div>
+          <div id="diagBox" class="diag-box">
+            <div>phase: <span id="diagPhase">idle</span></div>
+            <div>chat_ready: <span id="diagChatReady">false</span></div>
+            <div>chat_exit_code: <span id="diagChatExitCode">-</span></div>
+            <div class="diag-line">last_line: <span id="diagLastLine">-</span></div>
+            <div class="diag-line">last_error: <span id="diagLastError">-</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=47"></script>
+</body>
+</html>
