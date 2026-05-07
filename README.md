@@ -10,7 +10,7 @@ As demand for on-cloud Large Language Models (LLMs) rapidly grows, the high infe
 ![Framework](docs/framework.png)
 
 ---
-![UI example](docs/UI_example.gif)
+![UI example](docs/UI_video.gif)
 ## Getting Started
 
 AutoDraft is an **adaptive tree-based user-cloud distributed speculative decoding** framework. It consists of two cooperating processes:
