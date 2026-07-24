@@ -69,8 +69,8 @@ Once the server is up, run this on the user device. It connects to the server at
 from autodraft import Autodraft
 
 engine = Autodraft(
-    draft_model="meta-llama/Llama-3.3-70B-Instruct",
-    target_model="meta-llama/Llama-3.2-1B-Instruct",
+    draft_model="Qwen/Qwen2.5-14B-Instruct",
+    target_model="Qwen/Qwen2.5-1.5B-Instruct",
     draft_quantization="4bit",       # "none" / "4bit" / "8bit"
     target_quantization="4bit",      # "none" / "4bit" / "8bit"
     target_host="127.0.0.1",         # IP address of the server process
