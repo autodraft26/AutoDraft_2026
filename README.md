@@ -69,13 +69,13 @@ Once the server is up, run this on the user device. It connects to the server at
 from autodraft import Autodraft
 
 engine = Autodraft(
-    draft_model="meta-llama/Llama-3.2-1B-Instruct",
+    draft_model="meta-llama/Llama-3.3-70B-Instruct",
     target_model="meta-llama/Llama-3.2-1B-Instruct",
     draft_quantization="4bit",       # "none" / "4bit" / "8bit"
     target_quantization="4bit",      # "none" / "4bit" / "8bit"
     target_host="127.0.0.1",         # IP address of the server process
     target_port=26001,               # port the server process listens on
-    cost="draft_energy",             # "total_cost" (default) / "api_cost"
+    cost="total_cost",               # "total_cost" (default) / "api_cost"
                                      # also supports "draft_energy" / "target_energy"
     hf_token=None,                   # pass token here or set HF_TOKEN env var
 )
@@ -106,7 +106,7 @@ result = engine.run(
 **2.2.1 Get the project**
 
 ```bash
-git clone https://github.com/autodraft26/AutoDraft2026.git
+git clone https://github.com/autodraft26/AutoDraft_2026.git
 cd AutoDraft2026
 ```
 
