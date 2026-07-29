@@ -5,7 +5,7 @@ This repository is the official implementation of "AutoDraft: Automatic Cost-Per
 
 ## Abstract
 
-As demand for on-cloud Large Language Models (LLMs) rapidly grows, the high inference cost has become a critical system-level challenge. Recently, user-cloud distributed speculative decoding has emerged as a promising paradigm to reduce inference cost, wherein a lightweight draft model on the user device generates candidate tokens while a large target model on the cloud server verifies them in parallel. However, existing approaches rely on static configurations, failing to adapt to dynamic execution environments and varying query complexities, which often leads to redundant computation. To tackle this, we propose AutoDraft, a Service Level Objective (SLO)-aware runtime control framework that automatically profiles the execution environment and dynamically configures the draft tree structure including width, depth, and transmission nodes to satisfy diverse user-requested SLO, such as minimizing monetary cost or maximizing inference throughput. Extensive evaluations demonstrate that AutoDraft achieves 79% lower cloud LLM cost and 44% higher throughput compared to server-only baseline. We release AutoDraft as an open-source API, enabling users to specify high-level constraints and automatically control the framework without requiring deep system expertise.
+As demand for on-cloud Large Language Models (LLMs) rapidly grows, the high inference cost has become a critical system-level challenge. Recently, user-cloud distributed speculative decoding has emerged as a promising paradigm to reduce inference cost, wherein a lightweight draft model on the user device generates candidate tokens while a large target model on the cloud server verifies them in parallel. However, existing approaches rely on static configurations, failing to adapt to dynamic execution environments and varying query complexities, which often leads to redundant computation. To tackle this, we propose *AutoDraft*, a Service Level Objective (SLO)-aware runtime control framework that automatically profiles the execution environment and dynamically configures the draft tree structure including width, depth, and transmission nodes to satisfy diverse user-requested SLO, such as minimizing monetary cost or maximizing inference throughput. Extensive evaluations demonstrate that *AutoDraft* achieves 79% lower cloud LLM cost and 44% higher throughput compared to server-only baseline. We release AutoDraft as an open-source API, enabling users to specify high-level constraints and automatically control the framework without requiring deep system expertise.
 
 ![Framework](docs/framework.png)
 
@@ -13,7 +13,7 @@ As demand for on-cloud Large Language Models (LLMs) rapidly grows, the high infe
 ![UI example](docs/UI_video.gif)
 ## Getting Started
 
-AutoDraft is an **adaptive tree-based user-cloud distributed speculative decoding** framework. It consists of two cooperating processes:
+*AutoDraft* is an **adaptive tree-based user-cloud distributed speculative decoding** framework. It consists of two cooperating processes:
 
 1. **Server process** — runs the *target model* and verifies the draft tree.
 2. **User process** — runs the *draft model* and builds an adaptive token tree.
