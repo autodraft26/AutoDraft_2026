@@ -5,6 +5,7 @@ import random
 import socket
 import subprocess
 import threading
+import weakref
 from typing import List, Tuple
 import time
 import torch
@@ -926,17 +927,44 @@ def send_json(sock: socket.socket, payload: dict) -> None:
     sock.sendall(data)
 
 
+# Bytes read past a message terminator must survive until the next call: one
+# recv() routinely returns several newline-delimited messages when the peer
+# streams them faster than we drain, and dropping the tail silently loses whole
+# RPCs.
+_RECV_BUFFERS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _recv_line(sock: socket.socket) -> Tuple[bytes, int]:
+    """Read one non-empty newline-delimited message, keeping any surplus.
+
+    Empty lines (bare ``\\n`` / ``\\r\\n``) are skipped: some peers flush a
+    blank record on connect, and treating that as JSON kills the server.
+    """
+    buffer = _RECV_BUFFERS.get(sock, b"")
+    total_bytes = 0
+    while True:
+        while b"\n" not in buffer:
+            chunk = sock.recv(4096)
+            if not chunk:
+                _RECV_BUFFERS.pop(sock, None)
+                raise ConnectionError("Socket closed by peer")
+            buffer += chunk
+            total_bytes += len(chunk)
+        line, remainder = buffer.split(b"\n", 1)
+        buffer = remainder
+        # Tolerate CRLF and ignore blank keepalives.
+        line = line.rstrip(b"\r")
+        if line:
+            _RECV_BUFFERS[sock] = buffer
+            return line, total_bytes
+        # Keep draining blank lines from the same buffer before blocking again.
+        _RECV_BUFFERS[sock] = buffer
+
+
 def recv_json(sock: socket.socket) -> dict:
     """Receive JSON data"""
-    buffer = b""
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("Socket closed by peer")
-        buffer += chunk
-        if b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            return json.loads(line.decode("utf-8"))
+    line, _ = _recv_line(sock)
+    return json.loads(line.decode("utf-8"))
 
 
 def send_json_with_size(sock: socket.socket, payload: dict) -> int:
@@ -948,15 +976,6 @@ def send_json_with_size(sock: socket.socket, payload: dict) -> int:
 
 def recv_json_with_size(sock: socket.socket) -> Tuple[dict, int]:
     """Receives JSON data and returns the number of bytes received"""
-    buffer = b""
-    total_bytes = 0
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk:
-            raise ConnectionError("Socket closed by peer")
-        buffer += chunk
-        total_bytes += len(chunk)
-        if b"\n" in buffer:
-            line, buffer = buffer.split(b"\n", 1)
-            return json.loads(line.decode("utf-8")), total_bytes
+    line, total_bytes = _recv_line(sock)
+    return json.loads(line.decode("utf-8")), total_bytes
 

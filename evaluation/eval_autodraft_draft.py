@@ -1,5 +1,6 @@
 import argparse
 import copy
+import functools
 import glob
 import gc
 import hashlib
@@ -418,8 +419,15 @@ def _extract_question_turns(question: dict, bench_name: str) -> List[str]:
     return [q] if isinstance(q, str) and q else [str(q)]
 
 
-def _build_conversation_template_for_model(model_path: str):
+def _build_conversation_template_for_model(model_path: str, use_native_chat_template: bool = False):
     model_path_l = str(model_path or "").lower()
+    if use_native_chat_template or ("llama-3" in model_path_l) or ("llama3" in model_path_l):
+        # Prefer the checkpoint's own chat template for Llama-3.x (incl. 3.3).
+        # FastChat often lacks a matching template and falls back to Vicuna-style.
+        try:
+            return NativeChatConversation(model_path)
+        except Exception:
+            pass
     if "vicuna" in model_path_l:
         return get_conversation_template("vicuna")
     if ("llama-3" in model_path_l) or ("llama3" in model_path_l):
@@ -450,6 +458,62 @@ def _build_conversation_template_for_model(model_path: str):
     conv = get_conversation_template("llama-2-chat")
     conv.system_message = DEFAULT_CHAT_SYSTEM_PROMPT
     return conv
+
+
+@functools.lru_cache(maxsize=4)
+def _load_prompt_tokenizer(model_path: str):
+    return AutoTokenizer.from_pretrained(
+        model_path,
+        token=os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None,
+    )
+
+
+class NativeChatConversation:
+    """Renders prompts with the checkpoint's own chat template.
+
+    Exposes the subset of the fastchat ``Conversation`` API that the evaluation
+    loop uses. Needed for Llama-3.x (incl. 3.3): FastChat may lack a matching
+    template and silently serve a Vicuna-style one instead.
+    """
+
+    # The evaluation loop appends this after get_prompt(); a chat template
+    # already ends at the exact generation start, so nothing may follow it.
+    prompt_suffix = ""
+
+    def __init__(self, model_path: str):
+        self.name = "native_chat_template"
+        self.roles = ("user", "assistant")
+        self.messages: List[List[Any]] = []
+        self.stop_str = None
+        tokenizer = _load_prompt_tokenizer(model_path)
+        self._tokenizer = tokenizer
+        stop_ids = []
+        for token in ("<|eot_id|>", "<|end_of_text|>"):
+            token_id = tokenizer.convert_tokens_to_ids(token)
+            if token_id is not None and int(token_id) >= 0:
+                stop_ids.append(int(token_id))
+        if tokenizer.eos_token_id is not None:
+            stop_ids.append(int(tokenizer.eos_token_id))
+        self.stop_token_ids = sorted(set(stop_ids))
+
+    def append_message(self, role: str, message):
+        self.messages.append([role, message])
+
+    def get_prompt(self) -> str:
+        chat = [
+            {"role": str(role), "content": str(content)}
+            for role, content in self.messages
+            if content is not None
+        ]
+        prompt = self._tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=True
+        )
+        # Callers tokenize with add_special_tokens=True, which prepends BOS
+        # again; two BOS tokens push the prompt off the training distribution.
+        bos = self._tokenizer.bos_token
+        if bos and prompt.startswith(bos):
+            prompt = prompt[len(bos):]
+        return prompt
 
 
 def _ensure_remote_target_model(
@@ -650,7 +714,7 @@ def _resolve_cloud_transfer_costs(
 
 
 class DraftRunner:
-    def __init__(self, draft_model: torch.nn.Module, tokenizer: AutoTokenizer, debug: bool = False, profile_data: dict = None, draft_per_sec_cost: float = 0.0, target_per_sec_cost: float = 0.0, draft_electricity_cost_per_kwh: float = 0.2, user_communication_cost_per_gb: float = 0.09, cloud_outbound_cost_per_gb: float = 0.09, cost_sensitivity: float = 0.0, enable_gpu_monitor: bool = False, gpu_monitor_interval: float = 0.05, enable_cpu_monitor: bool = False, fix_gpu_clock: bool = False, gpu_graphics_clock_mhz: int = None, gpu_memory_clock_mhz: int = None, opt_tree: bool = False, no_draft_cost: bool = False, objective_metric: str = "total_cost", accept_length_margin: float = 0.05, objective_selection_mode: str = "blend", constraint_target: str = "metric", metric_constraint_per_token: float = None, min_tps_constraint: float = None, bill_draft_as_target_gpu: bool = False):
+    def __init__(self, draft_model: torch.nn.Module, tokenizer: AutoTokenizer, debug: bool = False, profile_data: dict = None, draft_per_sec_cost: float = 0.0, target_per_sec_cost: float = 0.0, draft_electricity_cost_per_kwh: float = 0.2, user_communication_cost_per_gb: float = 0.09, cloud_outbound_cost_per_gb: float = 0.09, cost_sensitivity: float = 0.0, enable_gpu_monitor: bool = False, gpu_monitor_interval: float = 0.05, enable_cpu_monitor: bool = False, fix_gpu_clock: bool = False, gpu_graphics_clock_mhz: int = None, gpu_memory_clock_mhz: int = None, opt_tree: bool = False, no_draft_cost: bool = False, objective_metric: str = "total_cost", accept_length_margin: float = 0.05, bill_draft_as_target_gpu: bool = False):
         
         self.draft_model = draft_model
         self.tokenizer = tokenizer
@@ -725,22 +789,6 @@ class DraftRunner:
         # - draft_energy
         # - target_energy
         self.objective_metric = _normalize_objective_metric(objective_metric)
-        self.objective_selection_mode = str(objective_selection_mode).lower() if objective_selection_mode is not None else "blend"
-        if self.objective_selection_mode not in {"blend", "constraint"}:
-            self.objective_selection_mode = "blend"
-        self.constraint_target = str(constraint_target).lower() if constraint_target is not None else "metric"
-        if self.constraint_target not in {"metric", "tps"}:
-            self.constraint_target = "metric"
-        self.metric_constraint_per_token = (
-            float(metric_constraint_per_token)
-            if metric_constraint_per_token is not None
-            else None
-        )
-        self.min_tps_constraint = (
-            float(min_tps_constraint)
-            if min_tps_constraint is not None and float(min_tps_constraint) > 0
-            else None
-        )
         # Tree objective rate
         # - total_cost : dollar/sec (GPU power EMA kWh/sec -> $/sec )
         # - api_cost : draft objective 0, target dollar/sec
@@ -805,17 +853,6 @@ class DraftRunner:
         self.accept_length_margin = max(0.0, min(0.99, float(accept_length_margin)))
         # target profile lookup
         self.target_profile_lookup_stats = {"direct_hit": 0, "nearest_hit": 0, "fallback": 0}
-        # constraint fallback (Tree )
-        self.constraint_fallback_stats = {
-            "width_candidate_feasible": 0,
-            "width_candidate_infeasible": 0,
-            "width_selected_feasible": 0,
-            "width_selected_fallback": 0,
-            "nnodes_candidate_feasible": 0,
-            "nnodes_candidate_infeasible": 0,
-            "nnodes_selected_feasible": 0,
-            "nnodes_selected_fallback": 0,
-        }
         # online profile update runtime options/paths
         self.draft_profile_file = None
         self.target_profile_file = None
@@ -996,16 +1033,6 @@ class DraftRunner:
             self.accept_length_actual_sum = 0.0
             self.accept_length_expected_sum = 0.0
             self.target_profile_lookup_stats = {"direct_hit": 0, "nearest_hit": 0, "fallback": 0}
-            self.constraint_fallback_stats = {
-                "width_candidate_feasible": 0,
-                "width_candidate_infeasible": 0,
-                "width_selected_feasible": 0,
-                "width_selected_fallback": 0,
-                "nnodes_candidate_feasible": 0,
-                "nnodes_candidate_infeasible": 0,
-                "nnodes_selected_feasible": 0,
-                "nnodes_selected_fallback": 0,
-            }
     
     def print_timing_stats(self):
         """Output average execution time of draft_model.model call by accumulated width"""
@@ -1157,10 +1184,6 @@ class DraftRunner:
             target_time_scale=self.get_target_verification_ratio_mean() if self.get_target_verification_ratio_mean() is not None else 1.0,
             accept_length_scale=accept_length_scale,
             accept_length_margin=self.accept_length_margin,
-            objective_selection_mode=self.objective_selection_mode,
-            constraint_target=self.constraint_target,
-            metric_constraint_per_token=self.metric_constraint_per_token,
-            min_tps_constraint=self.min_tps_constraint,
             draft_per_sec_cost=self.get_draft_objective_rate_per_sec(),
             target_per_sec_cost=self.get_target_objective_rate_per_sec(),
             cost_sensitivity=self.cost_sensitivity,
@@ -1285,9 +1308,6 @@ class DraftRunner:
             if hasattr(tree, "target_profile_lookup_stats"):
                 for k, v in tree.target_profile_lookup_stats.items():
                     self.target_profile_lookup_stats[k] = self.target_profile_lookup_stats.get(k, 0) + int(v)
-            if hasattr(tree, "constraint_decision_stats"):
-                for k, v in tree.constraint_decision_stats.items():
-                    self.constraint_fallback_stats[k] = self.constraint_fallback_stats.get(k, 0) + int(v)
 
         self.last_tree_timing_breakdown = {
             "tree_model_forward_ms": float(max(0.0, tree.draft_total_time) * 1000.0),
@@ -1852,10 +1872,6 @@ def profile_width_timing(
                     fixed_nnodes=False,
                     fixed_depth=fixed_depth,
                     accept_length_margin=getattr(runner, "accept_length_margin", 0.05),
-                    objective_selection_mode=getattr(runner, "objective_selection_mode", "blend"),
-                    constraint_target=getattr(runner, "constraint_target", "metric"),
-                    metric_constraint_per_token=getattr(runner, "metric_constraint_per_token", None),
-                    min_tps_constraint=getattr(runner, "min_tps_constraint", None),
                 )
                 
                 # initialize 
@@ -2946,15 +2962,8 @@ def save_reference_cache(
         "reference_target_objective_rate_per_sec": float(
             warmup_metrics.get("target_objective_rate_per_sec", 0.0)
         ),
-        "feasible_metric_per_token": warmup_metrics.get("feasible_metric_per_token", None),
-        "feasible_tps": warmup_metrics.get("feasible_tps", None),
         "reference_cs_anchor_curve": warmup_metrics.get("reference_cs_anchor_curve", None),
         "reference_tradeoff_curve_cs0_1": warmup_metrics.get("reference_tradeoff_curve_cs0_1", None),
-        "reference_constraint_anchor_curve": warmup_metrics.get("reference_constraint_anchor_curve", None),
-        "reference_tradeoff_curve_by_constraint": warmup_metrics.get("reference_tradeoff_curve_by_constraint", None),
-        "reference_constraint_center_per_1m_token": warmup_metrics.get(
-            "reference_constraint_center_per_1m_token", None
-        ),
         "reference_point_repeat_count": warmup_metrics.get("reference_point_repeat_count", None),
         "reference_point_selection_rule": warmup_metrics.get("reference_point_selection_rule", None),
         "reference_fixed_accept_length_scale": warmup_metrics.get(
@@ -3241,69 +3250,6 @@ def _build_reference_cause_summary(anchor_rows: List[dict], curve_rows: List[dic
         "anchor_cs_available": sorted(by_cs_summary.keys()),
         "transition_analysis": transitions,
     }
-
-
-def _build_reference_tradeoff_curve_by_constraint(anchor_rows: List[dict], constraint_target: str = "metric") -> List[dict]:
-    """
-    Build constraint-mode trade-off points sorted by active constraint selector.
-    Used when objective_selection_mode=constraint.
-    """
-    if not isinstance(anchor_rows, list):
-        return []
-    constraint_target = str(constraint_target or "metric").lower()
-    rows = []
-    for row in anchor_rows:
-        try:
-            tps = float(row.get("predicted_tps", 0.0))
-            m1m = float(
-                row.get(
-                    "predicted_metric_per_1m_token",
-                    row.get("predicted_objective_per_1m_token", 0.0),
-                )
-            )
-            out_row = {
-                "predicted_tps": tps,
-                "predicted_metric_per_1m_token": m1m,
-            }
-            if constraint_target == "tps":
-                out_row["min_tps_constraint"] = float(row.get("min_tps_constraint", tps))
-            else:
-                out_row["metric_constraint_per_1m_token"] = float(row.get("metric_constraint_per_1m_token"))
-            rows.append(out_row)
-        except Exception:
-            continue
-    sort_key = "min_tps_constraint" if constraint_target == "tps" else "metric_constraint_per_1m_token"
-    rows.sort(key=lambda x: x[sort_key])
-    return rows
-
-
-def _parse_reference_constraint_multipliers(value: str) -> List[float]:
-    """
-    Parse comma-separated multipliers used for reference constraint sweep.
-    Example: "0.8,1.0,1.2"
-    """
-    if value is None:
-        return [0.8, 1.0, 1.2]
-    out = []
-    for tok in str(value).split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            v = float(tok)
-        except Exception:
-            continue
-        if np.isfinite(v) and v > 0:
-            out.append(v)
-    if not out:
-        return [0.8, 1.0, 1.2]
-    # Remove near-duplicate values while preserving sort order.
-    out = sorted(out)
-    dedup = []
-    for v in out:
-        if not dedup or abs(v - dedup[-1]) > 1e-9:
-            dedup.append(v)
-    return dedup
 
 
 def load_server_only_baseline_metric(
@@ -4421,10 +4367,6 @@ def run_draft(
     user_communication_cost_per_gb: float = None,
     cloud_outbound_cost_per_gb: float = None,
     accept_length_margin: float = 0.05,
-    objective_selection_mode: str = "blend",
-    constraint_target: str = "metric",
-    metric_constraint_per_1m_token: float = None,
-    min_tps_constraint: float = None,
     total_metric_cap: float = float("inf"),
     cost_sensitivity: float = 0.0,
     opt_tree: bool = False,
@@ -4460,7 +4402,6 @@ def run_draft(
     reference_test_output_json: str = None,
     reference_cs_curve_rounds: int = 1,
     reference_max_steps_limit: int = 1,
-    reference_constraint_multipliers: str = "0.8,1.0,1.2",
     reference_force_refresh: bool = False,
     tokenizer_path: str = None,
     auto_target_profile: bool = True,
@@ -4520,49 +4461,12 @@ def run_draft(
         user_communication_cost_per_gb=user_communication_cost_per_gb,
         cloud_outbound_cost_per_gb=cloud_outbound_cost_per_gb,
     )
-    objective_selection_mode = str(objective_selection_mode).lower()
-    if objective_selection_mode not in {"blend", "constraint"}:
-        raise ValueError(
-            f"Unsupported objective_selection_mode: {objective_selection_mode}. Use 'blend' or 'constraint'."
-        )
-    constraint_target = str(constraint_target).lower()
-    if constraint_target not in {"metric", "tps"}:
-        raise ValueError(
-            f"Unsupported constraint_target: {constraint_target}. Use 'metric' or 'tps'."
-        )
-    if objective_selection_mode == "constraint":
-        if constraint_target == "metric" and metric_constraint_per_1m_token is not None and float(metric_constraint_per_1m_token) <= 0:
-            raise ValueError(
-                "--metric-constraint-per-1m-token must be > 0 when provided."
-            )
-        if constraint_target == "tps" and min_tps_constraint is not None and float(min_tps_constraint) < 0:
-            raise ValueError("--min-tps-constraint must be >= 0 when provided.")
-    user_metric_constraint_provided = (
-        constraint_target == "metric" and metric_constraint_per_1m_token is not None
-    )
-    metric_constraint_per_token = (
-        (float(metric_constraint_per_1m_token) / 1_000_000.0)
-        if constraint_target == "metric" and metric_constraint_per_1m_token is not None
-        else None
-    )
     total_metric_cap = float(total_metric_cap) if total_metric_cap is not None else float("inf")
     if np.isfinite(total_metric_cap) and total_metric_cap <= 0:
         raise ValueError("--total-metric-cap must be > 0 when provided.")
     reference_cs_curve_rounds = max(1, int(reference_cs_curve_rounds))
     reference_max_steps_limit = max(1, int(reference_max_steps_limit))
-    reference_constraint_multipliers_list = _parse_reference_constraint_multipliers(
-        reference_constraint_multipliers
-    )
-    if objective_selection_mode == "constraint":
-        reference_mode_key = (
-            f"{objective_selection_mode}|{constraint_target}|{objective_metric}|auto-center-blendcs50|"
-            + ",".join(f"{v:.6f}" for v in reference_constraint_multipliers_list)
-        )
-    else:
-        reference_mode_key = (
-            f"{objective_selection_mode}|{constraint_target}|{objective_metric}|"
-            + ",".join(f"{v:.6f}" for v in reference_constraint_multipliers_list)
-        )
+    reference_mode_key = f"blend|{objective_metric}"
     accept_length_margin = max(0.0, min(0.99, float(accept_length_margin)))
     if not server_only_baseline_json:
         script_dir = os.path.dirname(__file__)
@@ -4654,10 +4558,6 @@ def run_draft(
         no_draft_cost=no_draft_cost,
         objective_metric=objective_metric,
         accept_length_margin=accept_length_margin,
-        objective_selection_mode=objective_selection_mode,
-        constraint_target=constraint_target,
-        metric_constraint_per_token=metric_constraint_per_token,
-        min_tps_constraint=min_tps_constraint,
         bill_draft_as_target_gpu=bool(bill_draft_as_target_gpu),
     )
     if objective_metric == "total_cost" and (not no_draft_cost) and (not bill_draft_as_target_gpu):
@@ -4867,7 +4767,7 @@ def run_draft(
                 device_name=device_name,
                 target_quantization=resolved_target_quantization,
                 draft_quantization=draft_quantization,
-                objective_selection_mode=objective_selection_mode,
+                objective_selection_mode="blend",
                 reference_mode_key=reference_mode_key,
             )
             reference_cache = None
@@ -4885,17 +4785,11 @@ def run_draft(
                 device_name=device_name,
                 target_quantization=resolved_target_quantization,
                 draft_quantization=draft_quantization,
-                objective_selection_mode=objective_selection_mode,
+                objective_selection_mode="blend",
                 reference_mode_key=reference_mode_key,
             )
-        reference_feasible_metric_per_token = None
-        reference_feasible_tps = None
         reference_cs_anchor_curve = None
         reference_tradeoff_curve_cs0_1 = None
-        reference_constraint_anchor_curve = None
-        reference_tradeoff_curve_by_constraint = None
-        auto_reference_constraint_center_per_1m = None
-        auto_reference_constraint_center_tps = None
         if bool(force_server_only_ar):
             print("[Warmup] Skipping speculative warmup for server-only AR mode.")
             if reference_cache is None:
@@ -4908,18 +4802,6 @@ def run_draft(
                     "reference_tps": float(runner.reference_tps),
                     "reference_cost_per_token": float(runner.reference_cost_per_token),
                     "reference_objective_per_token": float(runner.reference_objective_per_token),
-                    "feasible_metric_per_token": {
-                        "min": point_metric,
-                        "max": point_metric,
-                        "mean": point_metric,
-                        "count": 1,
-                    },
-                    "feasible_tps": {
-                        "min": float(runner.reference_tps),
-                        "max": float(runner.reference_tps),
-                        "mean": float(runner.reference_tps),
-                        "count": 1,
-                    },
                 }
         else:
             print("[Warmup] Running warmup (3 rounds)")
@@ -4964,15 +4846,8 @@ def run_draft(
             if runner.uses_target_energy_objective():
                 if reference_target_objective_rate_per_sec > 0:
                     runner.target_objective_rate_per_sec = reference_target_objective_rate_per_sec
-            reference_feasible_metric_per_token = reference_cache.get("feasible_metric_per_token", None)
-            reference_feasible_tps = reference_cache.get("feasible_tps", None)
             reference_cs_anchor_curve = reference_cache.get("reference_cs_anchor_curve", None)
             reference_tradeoff_curve_cs0_1 = reference_cache.get("reference_tradeoff_curve_cs0_1", None)
-            reference_constraint_anchor_curve = reference_cache.get("reference_constraint_anchor_curve", None)
-            reference_tradeoff_curve_by_constraint = reference_cache.get("reference_tradeoff_curve_by_constraint", None)
-            auto_reference_constraint_center_per_1m = reference_cache.get(
-                "reference_constraint_center_per_1m_token", None
-            )
             selected_ref = _select_reference_anchor_for_cs(
                 reference_cs_anchor_curve,
                 float(runner.cost_sensitivity),
@@ -5095,396 +4970,102 @@ def run_draft(
                     ),
                     "reference_debug_trace": anchor_debug_trace,
                 }
-            if objective_selection_mode == "constraint":
-                print("[Reference] No cache found. Running full-query constraint anchors independently.")
-                print("[Reference] Deriving constraint center from blend(cs=0.5) full-query probe.")
-                saved_mode = runner.objective_selection_mode
-                saved_constraint_target = getattr(runner, "constraint_target", "metric")
-                saved_constraint = runner.metric_constraint_per_token
-                saved_min_tps = runner.min_tps_constraint
-                try:
-                    runner.objective_selection_mode = "blend"
-                    runner.metric_constraint_per_token = None
-                    runner.min_tps_constraint = None
-                    # 1) center calibration: dynamic scale
-                    center_metrics = _run_reference_warmup(
-                        cost_sensitivity_value=0.5,
-                        repeats=reference_point_repeats,
-                        select_last=False,
-                        fixed_scale=None,
-                        update_ratio=True,
-                        max_steps_limit=reference_max_steps_limit,
-                        reference_token_count_mode="actual",
-                        diverse_queries_per_round=True,
-                    )
-                    if constraint_target == "tps":
-                        base_constraint_tps = max(
-                            1e-9,
-                            float(center_metrics.get("token_per_second", runner.reference_tps)),
-                        )
-                        auto_reference_constraint_center_tps = float(base_constraint_tps)
-                        print(
-                            "[Reference] Auto TPS constraint center from blend(cs=0.5): "
-                            f"{base_constraint_tps:.6f} tok/s"
-                        )
-                    else:
-                        center_metric_per_token = float(
-                            center_metrics.get(
-                                "objective_per_token",
-                                center_metrics.get("cost_per_token", 0.0),
-                            )
-                        )
-                        base_constraint_1m = max(1e-9, center_metric_per_token * 1_000_000.0)
-                        auto_reference_constraint_center_per_1m = float(base_constraint_1m)
-                        if objective_metric in cost_objective_metrics:
-                            print(
-                                "[Reference] Auto constraint center from blend(cs=0.5): "
-                                f"${base_constraint_1m:.6f}/1M"
-                            )
-                        else:
-                            print(
-                                "[Reference] Auto constraint center from blend(cs=0.5): "
-                                f"{base_constraint_1m:.6f} kWh/1M"
-                            )
-                finally:
-                    runner.objective_selection_mode = saved_mode
-                    runner.constraint_target = saved_constraint_target
-                    runner.metric_constraint_per_token = saved_constraint
-                    runner.min_tps_constraint = saved_min_tps
-
-                def _measure_constraint_curve(
-                    center_value: float,
-                    repeats: int,
-                    select_last: bool,
-                    fixed_scale: Optional[float],
-                    update_ratio: bool,
-                    max_steps_limit: Optional[int],
-                ) -> List[dict]:
-                    anchors = sorted(
-                        {
-                            max(1e-9, float(center_value) * float(m))
-                            for m in reference_constraint_multipliers_list
-                        }
-                    )
-                    rows = []
-                    original_constraint = runner.metric_constraint_per_token
-                    original_min_tps = runner.min_tps_constraint
-                    original_mode = runner.objective_selection_mode
-                    original_target = getattr(runner, "constraint_target", "metric")
-                    try:
-                        runner.objective_selection_mode = "constraint"
-                        runner.constraint_target = constraint_target
-                        for anchor in anchors:
-                            if constraint_target == "tps":
-                                runner.metric_constraint_per_token = None
-                                runner.min_tps_constraint = float(anchor)
-                            else:
-                                runner.metric_constraint_per_token = float(anchor) / 1_000_000.0
-                                runner.min_tps_constraint = None
-                            anchor_metrics = _run_reference_warmup(
-                                cost_sensitivity_value=0.5,
-                                repeats=repeats,
-                                select_last=select_last,
-                                fixed_scale=fixed_scale,
-                                update_ratio=update_ratio,
-                                max_steps_limit=max_steps_limit,
-                                reference_token_count_mode=(
-                                    "clipped_expected"
-                                    if bool(select_last) and fixed_scale is not None
-                                    else "actual"
-                                ),
-                                diverse_queries_per_round=True,
-                                aggregate_query_means=(not bool(select_last)),
-                            )
-                            row = _build_anchor_row(
-                                anchor_value=0.5,
-                                anchor_metrics=anchor_metrics,
-                                fixed_scale=fixed_scale,
-                            )
-                            row.pop("cost_sensitivity", None)
-                            if constraint_target == "tps":
-                                row["min_tps_constraint"] = float(anchor)
-                            else:
-                                row["metric_constraint_per_1m_token"] = float(anchor)
-                            rows.append(row)
-                    finally:
-                        runner.metric_constraint_per_token = original_constraint
-                        runner.min_tps_constraint = original_min_tps
-                        runner.objective_selection_mode = original_mode
-                        runner.constraint_target = original_target
-                    return rows
-
-                center_value = (
-                    float(base_constraint_tps)
-                    if constraint_target == "tps"
-                    else float(base_constraint_1m)
-                )
-                selector_key = "min_tps_constraint" if constraint_target == "tps" else "metric_constraint_per_1m_token"
-                pass1_curve = _measure_constraint_curve(
-                    center_value=center_value,
+            print("[Reference] No cache found. Running full-query cs anchors independently.")
+            cs_anchors = [0.0, 0.5, 1.0]
+            # 1) Calibration over cs anchors to estimate actual/expected scale.
+            for cs_anchor in cs_anchors:
+                _run_reference_warmup(
+                    cost_sensitivity_value=float(cs_anchor),
                     repeats=reference_point_repeats,
                     select_last=False,
                     fixed_scale=None,
                     update_ratio=True,
                     max_steps_limit=reference_max_steps_limit,
+                    reference_token_count_mode="actual",
+                    diverse_queries_per_round=True,
                 )
-                pass1_ref_row = (
-                    min(
-                        pass1_curve,
-                        key=lambda row: abs(
-                            float(row.get(selector_key, 0.0)) - float(center_value)
-                        ),
-                    )
-                    if pass1_curve else None
-                )
-                recentered_constraint_value = center_value
-                if pass1_ref_row is not None:
-                    if constraint_target == "tps":
-                        measured_center_value = float(pass1_ref_row.get("predicted_tps", 0.0))
-                    else:
-                        measured_center_value = float(pass1_ref_row.get("predicted_metric_per_1m_token", 0.0))
-                    if np.isfinite(measured_center_value) and measured_center_value > 0:
-                        recentered_constraint_value = max(1e-9, float(measured_center_value))
+            fixed_reference_accept_scale = (
+                float(runner.get_accept_length_ratio_mean())
+                if runner.get_accept_length_ratio_mean() is not None
+                else 1.0
+            )
+            print(
+                "[Reference] Fixed accept_length_scale after calibration: "
+                f"{fixed_reference_accept_scale:.6f}"
+            )
 
-                if abs(recentered_constraint_value - float(center_value)) / max(1e-9, float(center_value)) > 1e-3:
-                    if constraint_target == "tps":
-                        print(
-                            "[Reference] Re-centering TPS constraint anchors: "
-                            f"{center_value:.6f} tok/s -> {recentered_constraint_value:.6f} tok/s"
-                        )
-                    elif objective_metric in cost_objective_metrics:
-                        print(
-                            "[Reference] Re-centering constraint anchors: "
-                            f"${center_value:.6f}/1M -> ${recentered_constraint_value:.6f}/1M"
-                        )
-                    else:
-                        print(
-                            "[Reference] Re-centering constraint anchors: "
-                            f"{center_value:.6f} -> {recentered_constraint_value:.6f} kWh/1M"
-                        )
-                # 2) recentered anchors calibration: dynamic scale
-                _measure_constraint_curve(
-                    center_value=recentered_constraint_value,
-                    repeats=reference_point_repeats,
-                    select_last=False,
-                    fixed_scale=None,
-                    update_ratio=True,
-                    max_steps_limit=reference_max_steps_limit,
-                )
-                fixed_reference_accept_scale = (
-                    float(runner.get_accept_length_ratio_mean())
-                    if runner.get_accept_length_ratio_mean() is not None
-                    else 1.0
-                )
-                print(
-                    "[Reference] Fixed accept_length_scale after calibration: "
-                    f"{fixed_reference_accept_scale:.6f}"
-                )
-                # 3) final evaluation: scale
-                reference_constraint_anchor_curve = _measure_constraint_curve(
-                    center_value=recentered_constraint_value,
+            # 2) Final evaluation with the fixed scale.
+            reference_cs_anchor_curve = []
+            anchor_metrics_map = {}
+            for cs_anchor in cs_anchors:
+                anchor_metrics = _run_reference_warmup(
+                    cost_sensitivity_value=float(cs_anchor),
                     repeats=reference_point_repeats,
                     select_last=False,
                     fixed_scale=fixed_reference_accept_scale,
                     update_ratio=False,
                     max_steps_limit=reference_max_steps_limit,
+                    reference_token_count_mode="clipped_expected",
+                    diverse_queries_per_round=True,
+                    aggregate_query_means=True,
                 )
-                if constraint_target == "tps":
-                    auto_reference_constraint_center_tps = float(recentered_constraint_value)
-                else:
-                    auto_reference_constraint_center_per_1m = float(recentered_constraint_value)
+                row = _build_anchor_row(
+                    anchor_value=float(cs_anchor),
+                    anchor_metrics=anchor_metrics,
+                    fixed_scale=fixed_reference_accept_scale,
+                )
+                reference_cs_anchor_curve.append(row)
+                anchor_metrics_map[round(float(cs_anchor), 6)] = row
 
-                if reference_constraint_anchor_curve:
-                    ref_row = min(
-                        reference_constraint_anchor_curve,
-                        key=lambda row: abs(
-                            float(row.get(selector_key, 0.0)) - float(recentered_constraint_value)
-                        ),
+            # Select the reference row for the requested cs.
+            ref_row = _select_reference_anchor_for_cs(
+                reference_cs_anchor_curve,
+                float(runner.cost_sensitivity),
+            )
+            if ref_row is None:
+                ref_row = anchor_metrics_map.get(0.5, reference_cs_anchor_curve[0] if reference_cs_anchor_curve else None)
+            reference_tps = float(ref_row.get("predicted_tps", 0.0)) if ref_row else 0.0
+            reference_cost_per_token = float(ref_row.get("predicted_cost_per_token", 0.0)) if ref_row else 0.0
+            reference_obj_per_token = float(ref_row.get("predicted_objective_per_token", 0.0)) if ref_row else 0.0
+            reference_draft_objective_rate_per_sec = float(ref_row.get("draft_objective_rate_per_sec", 0.0)) if ref_row else 0.0
+            reference_target_objective_rate_per_sec = float(ref_row.get("target_objective_rate_per_sec", 0.0)) if ref_row else 0.0
+            if isinstance(ref_row, dict):
+                if bool(ref_row.get("_selected_ref_interpolated", False)):
+                    print(
+                        "[Reference] CS-specific reference selected "
+                        f"(cs={float(runner.cost_sensitivity):.2g}, "
+                        f"interp={float(ref_row.get('_selected_ref_cs_left', 0.0)):.2g}"
+                        f"~{float(ref_row.get('_selected_ref_cs_right', 0.0)):.2g})."
                     )
                 else:
-                    ref_row = None
-                reference_tps = float(ref_row.get("predicted_tps", 0.0)) if ref_row else 0.0
-                reference_cost_per_token = float(ref_row.get("predicted_cost_per_token", 0.0)) if ref_row else 0.0
-                reference_obj_per_token = float(ref_row.get("predicted_objective_per_token", 0.0)) if ref_row else 0.0
-                reference_draft_objective_rate_per_sec = float(
-                    ref_row.get("draft_objective_rate_per_sec", 0.0)
-                ) if ref_row else 0.0
-                reference_target_objective_rate_per_sec = float(
-                    ref_row.get("target_objective_rate_per_sec", 0.0)
-                ) if ref_row else 0.0
-                if reference_tps > 0:
-                    runner.reference_tps = float(reference_tps)
-                if reference_cost_per_token > 0:
-                    runner.reference_cost_per_token = float(reference_cost_per_token)
-                if reference_obj_per_token > 0:
-                    runner.reference_objective_per_token = float(reference_obj_per_token)
-                if runner.uses_draft_energy_objective() and reference_draft_objective_rate_per_sec > 0:
-                    runner.draft_objective_rate_per_sec = float(reference_draft_objective_rate_per_sec)
-                if runner.uses_target_energy_objective() and reference_target_objective_rate_per_sec > 0:
-                    runner.target_objective_rate_per_sec = float(reference_target_objective_rate_per_sec)
-
-                metric_vals = [
-                    float(row.get("predicted_metric_per_token", 0.0))
-                    for row in reference_constraint_anchor_curve
-                ]
-                tps_vals = [
-                    float(row.get("predicted_tps", 0.0))
-                    for row in reference_constraint_anchor_curve
-                ]
-                if metric_vals and tps_vals:
-                    reference_feasible_metric_per_token = {
-                        "min": float(min(metric_vals)),
-                        "max": float(max(metric_vals)),
-                        "mean": float(sum(metric_vals) / len(metric_vals)),
-                        "count": int(len(metric_vals)),
-                    }
-                    reference_feasible_tps = {
-                        "min": float(min(tps_vals)),
-                        "max": float(max(tps_vals)),
-                        "mean": float(sum(tps_vals) / len(tps_vals)),
-                        "count": int(len(tps_vals)),
-                    }
-                else:
-                    reference_feasible_metric_per_token = None
-                    reference_feasible_tps = None
-                reference_tradeoff_curve_by_constraint = _build_reference_tradeoff_curve_by_constraint(
-                    reference_constraint_anchor_curve,
-                    constraint_target=constraint_target,
-                )
-                reference_cs_anchor_curve = None
-                reference_tradeoff_curve_cs0_1 = None
-            else:
-                print("[Reference] No cache found. Running full-query cs anchors independently.")
-                cs_anchors = [0.0, 0.5, 1.0]
-                # 1) Calibration over cs anchors to estimate actual/expected scale.
-                for cs_anchor in cs_anchors:
-                    _run_reference_warmup(
-                        cost_sensitivity_value=float(cs_anchor),
-                        repeats=reference_point_repeats,
-                        select_last=False,
-                        fixed_scale=None,
-                        update_ratio=True,
-                        max_steps_limit=reference_max_steps_limit,
-                        reference_token_count_mode="actual",
-                        diverse_queries_per_round=True,
+                    print(
+                        "[Reference] CS-specific reference selected "
+                        f"(cs={float(ref_row.get('_selected_ref_cs', runner.cost_sensitivity)):.2g})."
                     )
-                fixed_reference_accept_scale = (
-                    float(runner.get_accept_length_ratio_mean())
-                    if runner.get_accept_length_ratio_mean() is not None
-                    else 1.0
-                )
-                print(
-                    "[Reference] Fixed accept_length_scale after calibration: "
-                    f"{fixed_reference_accept_scale:.6f}"
-                )
+            if reference_tps > 0:
+                runner.reference_tps = float(reference_tps)
+            if reference_cost_per_token > 0:
+                runner.reference_cost_per_token = float(reference_cost_per_token)
+            if reference_obj_per_token > 0:
+                runner.reference_objective_per_token = float(reference_obj_per_token)
+            if runner.uses_draft_energy_objective() and reference_draft_objective_rate_per_sec > 0:
+                runner.draft_objective_rate_per_sec = float(reference_draft_objective_rate_per_sec)
+            if runner.uses_target_energy_objective() and reference_target_objective_rate_per_sec > 0:
+                runner.target_objective_rate_per_sec = float(reference_target_objective_rate_per_sec)
 
-                # 2) Final evaluation with the fixed scale.
-                reference_cs_anchor_curve = []
-                anchor_metrics_map = {}
-                for cs_anchor in cs_anchors:
-                    anchor_metrics = _run_reference_warmup(
-                        cost_sensitivity_value=float(cs_anchor),
-                        repeats=reference_point_repeats,
-                        select_last=False,
-                        fixed_scale=fixed_reference_accept_scale,
-                        update_ratio=False,
-                        max_steps_limit=reference_max_steps_limit,
-                        reference_token_count_mode="clipped_expected",
-                        diverse_queries_per_round=True,
-                        aggregate_query_means=True,
-                    )
-                    row = _build_anchor_row(
-                        anchor_value=float(cs_anchor),
-                        anchor_metrics=anchor_metrics,
-                        fixed_scale=fixed_reference_accept_scale,
-                    )
-                    reference_cs_anchor_curve.append(row)
-                    anchor_metrics_map[round(float(cs_anchor), 6)] = row
-
-                # Select the reference row for the requested cs.
-                ref_row = _select_reference_anchor_for_cs(
-                    reference_cs_anchor_curve,
-                    float(runner.cost_sensitivity),
-                )
-                if ref_row is None:
-                    ref_row = anchor_metrics_map.get(0.5, reference_cs_anchor_curve[0] if reference_cs_anchor_curve else None)
-                reference_tps = float(ref_row.get("predicted_tps", 0.0)) if ref_row else 0.0
-                reference_cost_per_token = float(ref_row.get("predicted_cost_per_token", 0.0)) if ref_row else 0.0
-                reference_obj_per_token = float(ref_row.get("predicted_objective_per_token", 0.0)) if ref_row else 0.0
-                reference_draft_objective_rate_per_sec = float(ref_row.get("draft_objective_rate_per_sec", 0.0)) if ref_row else 0.0
-                reference_target_objective_rate_per_sec = float(ref_row.get("target_objective_rate_per_sec", 0.0)) if ref_row else 0.0
-                if isinstance(ref_row, dict):
-                    if bool(ref_row.get("_selected_ref_interpolated", False)):
-                        print(
-                            "[Reference] CS-specific reference selected "
-                            f"(cs={float(runner.cost_sensitivity):.2g}, "
-                            f"interp={float(ref_row.get('_selected_ref_cs_left', 0.0)):.2g}"
-                            f"~{float(ref_row.get('_selected_ref_cs_right', 0.0)):.2g})."
-                        )
-                    else:
-                        print(
-                            "[Reference] CS-specific reference selected "
-                            f"(cs={float(ref_row.get('_selected_ref_cs', runner.cost_sensitivity)):.2g})."
-                        )
-                if reference_tps > 0:
-                    runner.reference_tps = float(reference_tps)
-                if reference_cost_per_token > 0:
-                    runner.reference_cost_per_token = float(reference_cost_per_token)
-                if reference_obj_per_token > 0:
-                    runner.reference_objective_per_token = float(reference_obj_per_token)
-                if runner.uses_draft_energy_objective() and reference_draft_objective_rate_per_sec > 0:
-                    runner.draft_objective_rate_per_sec = float(reference_draft_objective_rate_per_sec)
-                if runner.uses_target_energy_objective() and reference_target_objective_rate_per_sec > 0:
-                    runner.target_objective_rate_per_sec = float(reference_target_objective_rate_per_sec)
-                # Feasible range endpoints: cs=0 and cs=1.
-                row0 = anchor_metrics_map.get(0)
-                row1 = anchor_metrics_map.get(1.0)
-                if row0 is not None and row1 is not None:
-                    m0 = float(row0.get("predicted_metric_per_token", 0.0))
-                    m1 = float(row1.get("predicted_metric_per_token", 0.0))
-                    t0 = float(row0.get("predicted_tps", 0.0))
-                    t1 = float(row1.get("predicted_tps", 0.0))
-                    reference_feasible_metric_per_token = {
-                        "min": float(min(m0, m1)),
-                        "max": float(max(m0, m1)),
-                        "mean": float((m0 + m1) / 2.0),
-                        "count": 2,
-                    }
-                    reference_feasible_tps = {
-                        "min": float(min(t0, t1)),
-                        "max": float(max(t0, t1)),
-                        "mean": float((t0 + t1) / 2.0),
-                        "count": 2,
-                    }
-                else:
-                    reference_feasible_metric_per_token = None
-                    reference_feasible_tps = None
-
-                reference_tradeoff_curve_cs0_1 = _build_reference_tradeoff_curve(
-                    reference_cs_anchor_curve,
-                    step=0.05,
-                )
-                reference_constraint_anchor_curve = None
-                reference_tradeoff_curve_by_constraint = None
+            reference_tradeoff_curve_cs0_1 = _build_reference_tradeoff_curve(
+                reference_cs_anchor_curve,
+                step=0.05,
+            )
 
             reference_metrics = {
                 "token_per_second": float(runner.reference_tps),
                 "cost_per_token": float(runner.reference_cost_per_token),
                 "objective_per_token": float(runner.reference_objective_per_token),
-                "constraint_target": str(constraint_target),
                 "draft_objective_rate_per_sec": float(reference_draft_objective_rate_per_sec),
                 "target_objective_rate_per_sec": float(reference_target_objective_rate_per_sec),
-                "feasible_metric_per_token": reference_feasible_metric_per_token,
-                "feasible_tps": reference_feasible_tps,
                 "reference_cs_anchor_curve": reference_cs_anchor_curve,
                 "reference_tradeoff_curve_cs0_1": reference_tradeoff_curve_cs0_1,
-                "reference_constraint_anchor_curve": reference_constraint_anchor_curve,
-                "reference_tradeoff_curve_by_constraint": reference_tradeoff_curve_by_constraint,
-                "reference_constraint_center_per_1m_token": (
-                    float(auto_reference_constraint_center_per_1m)
-                    if auto_reference_constraint_center_per_1m is not None
-                    else None
-                ),
                 "reference_point_repeat_count": int(reference_point_repeats),
                 "reference_max_steps_limit": int(reference_max_steps_limit),
                 "reference_point_selection_rule": "mean_over_queries_with_fixed_scale_after_calibration",
@@ -5505,18 +5086,10 @@ def run_draft(
                     if ref_row is not None
                     else None
                 ),
-                "reference_monotonicity_summary": (
-                    _analyze_reference_tradeoff_curve(reference_tradeoff_curve_cs0_1)
-                    if objective_selection_mode != "constraint"
-                    else None
-                ),
-                "reference_cause_summary": (
-                    _build_reference_cause_summary(
-                        reference_cs_anchor_curve,
-                        reference_tradeoff_curve_cs0_1,
-                    )
-                    if objective_selection_mode != "constraint"
-                    else None
+                "reference_monotonicity_summary": _analyze_reference_tradeoff_curve(reference_tradeoff_curve_cs0_1),
+                "reference_cause_summary": _build_reference_cause_summary(
+                    reference_cs_anchor_curve,
+                    reference_tradeoff_curve_cs0_1,
                 ),
                 "reference_debug_trace": (
                     {"anchor_rows": reference_cs_anchor_curve}
@@ -5527,194 +5100,39 @@ def run_draft(
             save_reference_cache(
                 cache_path=reference_cache_path,
                 warmup_metrics=reference_metrics,
-                objective_selection_mode=objective_selection_mode,
+                objective_selection_mode="blend",
             )
             print(f"[Reference] Saved reference cache: {reference_cache_path}")
-        if objective_selection_mode == "constraint":
-            if (
-                (not isinstance(reference_tradeoff_curve_by_constraint, list) or not reference_tradeoff_curve_by_constraint)
-                and isinstance(reference_constraint_anchor_curve, list)
-            ):
-                reference_tradeoff_curve_by_constraint = _build_reference_tradeoff_curve_by_constraint(
-                    reference_constraint_anchor_curve,
-                    constraint_target=constraint_target,
-                )
+        if (
+            (not isinstance(reference_tradeoff_curve_cs0_1, list) or not reference_tradeoff_curve_cs0_1)
+            and isinstance(reference_cs_anchor_curve, list)
+        ):
+            reference_tradeoff_curve_cs0_1 = _build_reference_tradeoff_curve(
+                reference_cs_anchor_curve,
+                step=0.05,
+            )
+        if isinstance(reference_cs_anchor_curve, list) and reference_cs_anchor_curve:
+            metric_vals = [
+                float(row.get("predicted_metric_per_token", 0.0))
+                for row in reference_cs_anchor_curve
+            ]
+            tps_vals = [
+                float(row.get("predicted_tps", 0.0))
+                for row in reference_cs_anchor_curve
+            ]
+            reference_feasible_metric_per_token = {
+                "min": float(min(metric_vals)),
+                "max": float(max(metric_vals)),
+                "mean": float(sum(metric_vals) / len(metric_vals)),
+                "count": int(len(metric_vals)),
+            }
+            reference_feasible_tps = {
+                "min": float(min(tps_vals)),
+                "max": float(max(tps_vals)),
+                "mean": float(sum(tps_vals) / len(tps_vals)),
+                "count": int(len(tps_vals)),
+            }
         else:
-            if (
-                (not isinstance(reference_tradeoff_curve_cs0_1, list) or not reference_tradeoff_curve_cs0_1)
-                and isinstance(reference_cs_anchor_curve, list)
-            ):
-                reference_tradeoff_curve_cs0_1 = _build_reference_tradeoff_curve(
-                    reference_cs_anchor_curve,
-                    step=0.05,
-                )
-        if objective_selection_mode == "constraint":
-            runner.constraint_target = constraint_target
-            if constraint_target == "tps":
-                runner.metric_constraint_per_token = None
-                if min_tps_constraint is None or float(min_tps_constraint) <= 0:
-                    inferred_center_tps = (
-                        float(auto_reference_constraint_center_tps)
-                        if auto_reference_constraint_center_tps is not None
-                        else float(runner.reference_tps)
-                    )
-                    min_tps_constraint = max(1e-9, float(inferred_center_tps))
-                    runner.min_tps_constraint = float(min_tps_constraint)
-                    print(
-                        "[INFO] --min-tps-constraint not provided; "
-                        f"using auto center {float(min_tps_constraint):.6f} tok/s."
-                    )
-                else:
-                    runner.min_tps_constraint = float(min_tps_constraint)
-            else:
-                runner.min_tps_constraint = None
-                if metric_constraint_per_1m_token is None:
-                    inferred_center_1m = (
-                        float(auto_reference_constraint_center_per_1m)
-                        if auto_reference_constraint_center_per_1m is not None
-                        else float(runner.reference_objective_per_token) * 1_000_000.0
-                    )
-                    metric_constraint_per_1m_token = max(1e-9, float(inferred_center_1m))
-                    metric_constraint_per_token = float(metric_constraint_per_1m_token) / 1_000_000.0
-                    runner.metric_constraint_per_token = float(metric_constraint_per_token)
-                    if objective_metric in cost_objective_metrics:
-                        print(
-                            "[INFO] --metric-constraint-per-1m-token not provided; "
-                            f"using auto center ${float(metric_constraint_per_1m_token):.6f}/1M."
-                        )
-                    else:
-                        print(
-                            "[INFO] --metric-constraint-per-1m-token not provided; "
-                            f"using auto center {float(metric_constraint_per_1m_token):.6f} kWh/1M."
-                        )
-                else:
-                    metric_constraint_per_token = float(metric_constraint_per_1m_token) / 1_000_000.0
-                    runner.metric_constraint_per_token = float(metric_constraint_per_token)
-        print(
-            "[Warmup Reference] "
-            f"reference_tps={runner.reference_tps:.6f}, "
-            f"reference_cost_per_token={runner.reference_cost_per_token:.12f}, "
-            f"reference_objective_per_token={runner.reference_objective_per_token:.12f}"
-        )
-        if isinstance(reference_feasible_metric_per_token, dict):
-            f_min = reference_feasible_metric_per_token.get("min", None)
-            f_max = reference_feasible_metric_per_token.get("max", None)
-            if f_min is not None and f_max is not None:
-                if objective_metric in cost_objective_metrics:
-                    print(
-                        "[Warmup Reference] feasible metric range (approx): "
-                        f"${float(f_min)*1_000_000.0:.6f} ~ ${float(f_max)*1_000_000.0:.6f} per 1M tokens"
-                    )
-                else:
-                    print(
-                        "[Warmup Reference] feasible metric range (approx): "
-                        f"{float(f_min)*1_000_000.0:.6f} ~ {float(f_max)*1_000_000.0:.6f} kWh per 1M tokens"
-                    )
-                if (
-                    objective_selection_mode == "constraint"
-                    and constraint_target == "metric"
-                    and metric_constraint_per_token is not None
-                    and metric_constraint_per_token > 0
-                ):
-                    c = float(metric_constraint_per_token)
-                    f_min_val = float(f_min)
-                    f_max_val = float(f_max)
-                    if c < f_min_val:
-                        unit = "$" if objective_metric in cost_objective_metrics else "kWh"
-                        print(
-                            "[WARN] metric constraint is tighter than reference feasible lower bound. "
-                            f"constraint={unit}{c*1_000_000.0:.6f}/1M, "
-                            f"feasible_min={unit}{f_min_val*1_000_000.0:.6f}/1M. "
-                            "Most steps may be infeasible; fallback behavior may dominate."
-                        )
-                    elif c > f_max_val:
-                        unit = "$" if objective_metric in cost_objective_metrics else "kWh"
-                        print(
-                            "[WARN] metric constraint is looser than reference feasible upper bound. "
-                            f"constraint={unit}{c*1_000_000.0:.6f}/1M, "
-                            f"feasible_max={unit}{f_max_val*1_000_000.0:.6f}/1M. "
-                            "Constraint may have little practical effect."
-                        )
-        if isinstance(reference_feasible_tps, dict):
-            t_min = reference_feasible_tps.get("min", None)
-            t_max = reference_feasible_tps.get("max", None)
-            if t_min is not None and t_max is not None:
-                print(
-                    "[Warmup Reference] feasible hybrid TPS range (approx): "
-                    f"{float(t_min):.6f} ~ {float(t_max):.6f}"
-                )
-                if (
-                    objective_selection_mode == "constraint"
-                    and constraint_target == "tps"
-                    and min_tps_constraint is not None
-                    and float(min_tps_constraint) > 0
-                ):
-                    c = float(min_tps_constraint)
-                    t_min_val = float(t_min)
-                    t_max_val = float(t_max)
-                    if c > t_max_val:
-                        print(
-                            "[WARN] TPS constraint is higher than reference feasible upper bound. "
-                            f"constraint={c:.6f} tok/s, feasible_max={t_max_val:.6f} tok/s. "
-                            "Most steps may be infeasible; fallback behavior may dominate."
-                        )
-                    elif c < t_min_val:
-                        print(
-                            "[WARN] TPS constraint is lower than reference feasible lower bound. "
-                            f"constraint={c:.6f} tok/s, feasible_min={t_min_val:.6f} tok/s. "
-                            "Constraint may have little practical effect."
-                        )
-        if objective_selection_mode == "constraint":
-            if isinstance(reference_constraint_anchor_curve, list) and reference_constraint_anchor_curve:
-                print("[Warmup Reference] constraint anchor curve (predicted):")
-                for row in reference_constraint_anchor_curve:
-                    tps = float(row.get("predicted_tps", 0.0))
-                    obj_1m = float(
-                        row.get(
-                            "predicted_metric_per_1m_token",
-                            row.get("predicted_objective_per_1m_token", 0.0),
-                        )
-                    )
-                    if constraint_target == "tps":
-                        c_tps = float(row.get("min_tps_constraint", 0.0))
-                        if objective_metric in cost_objective_metrics:
-                            print(f"  - min_tps={c_tps:.6f}: tps={tps:.6f}, cost/1M=${obj_1m:.6f}")
-                        else:
-                            print(f"  - min_tps={c_tps:.6f}: tps={tps:.6f}, energy/1M={obj_1m:.6f} kWh")
-                    elif objective_metric in cost_objective_metrics:
-                        c1m = float(row.get("metric_constraint_per_1m_token", 0.0))
-                        print(f"  - constraint=${c1m:.6f}/1M: tps={tps:.6f}, cost/1M=${obj_1m:.6f}")
-                    else:
-                        c1m = float(row.get("metric_constraint_per_1m_token", 0.0))
-                        print(f"  - constraint={c1m:.6f} kWh/1M: tps={tps:.6f}, energy/1M={obj_1m:.6f} kWh")
-            if isinstance(reference_tradeoff_curve_by_constraint, list) and reference_tradeoff_curve_by_constraint:
-                print(
-                    "[Warmup Reference] trade-off curve available for constraint anchors "
-                    f"({len(reference_tradeoff_curve_by_constraint)} points)."
-                )
-        else:
-            if isinstance(reference_cs_anchor_curve, list) and reference_cs_anchor_curve:
-                print("[Warmup Reference] cs anchor curve (predicted):")
-                for row in reference_cs_anchor_curve:
-                    cs = float(row.get("cost_sensitivity", 0.0))
-                    tps = float(row.get("predicted_tps", 0.0))
-                    obj_1m = float(
-                        row.get(
-                            "predicted_metric_per_1m_token",
-                            row.get("predicted_objective_per_1m_token", 0.0),
-                        )
-                    )
-                    if objective_metric in cost_objective_metrics:
-                        print(f"  - cs={cs:.2g}: tps={tps:.6f}, cost/1M=${obj_1m:.6f}")
-                    else:
-                        print(f"  - cs={cs:.2g}: tps={tps:.6f}, energy/1M={obj_1m:.6f} kWh")
-            if isinstance(reference_tradeoff_curve_cs0_1, list) and reference_tradeoff_curve_cs0_1:
-                print(
-                    "[Warmup Reference] trade-off curve available for cs=0~1 "
-                    f"({len(reference_tradeoff_curve_cs0_1)} points, step=0.05)."
-                )
-        if not isinstance(reference_feasible_metric_per_token, dict):
-            # Fallback to a single-point feasible range.
             point_metric = (
                 float(runner.reference_cost_per_token)
                 if objective_metric == "total_cost"
@@ -5726,11 +5144,6 @@ def run_draft(
                 "mean": point_metric,
                 "count": 1,
             }
-            print(
-                "[WARN] reference feasible metric range missing in cache; "
-                "using reference point as fallback range."
-            )
-        if not isinstance(reference_feasible_tps, dict):
             point_tps = float(runner.reference_tps)
             reference_feasible_tps = {
                 "min": point_tps,
@@ -5738,9 +5151,31 @@ def run_draft(
                 "mean": point_tps,
                 "count": 1,
             }
+        print(
+            "[Warmup Reference] "
+            f"reference_tps={runner.reference_tps:.6f}, "
+            f"reference_cost_per_token={runner.reference_cost_per_token:.12f}, "
+            f"reference_objective_per_token={runner.reference_objective_per_token:.12f}"
+        )
+        if isinstance(reference_cs_anchor_curve, list) and reference_cs_anchor_curve:
+            print("[Warmup Reference] cs anchor curve (predicted):")
+            for row in reference_cs_anchor_curve:
+                cs = float(row.get("cost_sensitivity", 0.0))
+                tps = float(row.get("predicted_tps", 0.0))
+                obj_1m = float(
+                    row.get(
+                        "predicted_metric_per_1m_token",
+                        row.get("predicted_objective_per_1m_token", 0.0),
+                    )
+                )
+                if objective_metric in cost_objective_metrics:
+                    print(f"  - cs={cs:.2g}: tps={tps:.6f}, cost/1M=${obj_1m:.6f}")
+                else:
+                    print(f"  - cs={cs:.2g}: tps={tps:.6f}, energy/1M={obj_1m:.6f} kWh")
+        if isinstance(reference_tradeoff_curve_cs0_1, list) and reference_tradeoff_curve_cs0_1:
             print(
-                "[WARN] reference feasible TPS range missing in cache; "
-                "using reference TPS as fallback range."
+                "[Warmup Reference] trade-off curve available for cs=0~1 "
+                f"({len(reference_tradeoff_curve_cs0_1)} points, step=0.05)."
             )
         reset_gpu_monitor_after_reference(runner)
         server_only_mode = False
@@ -5925,7 +5360,7 @@ def run_draft(
             report = {
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "objective_metric": str(objective_metric),
-                "objective_selection_mode": str(objective_selection_mode),
+                "objective_selection_mode": "blend",
                 "reference_test_runs": int(probe_runs),
                 "hybrid": {
                     "predicted_metric_per_1m_range": hybrid_pred_metric,
@@ -6721,12 +6156,7 @@ def run_draft(
                             "reference_tps": float(runner.reference_tps),
                             "reference_objective_per_token": float(runner.reference_objective_per_token),
                             "objective_metric": str(objective_metric),
-                            "objective_selection_mode": str(objective_selection_mode),
-                            "metric_constraint_per_token": (
-                                float(metric_constraint_per_token)
-                                if metric_constraint_per_token is not None
-                                else None
-                            ),
+                            "objective_selection_mode": "blend",
                             "no_draft_cost": bool(no_draft_cost),
                         }
                         d2t_bytes = send_json_with_size(sock, server_only_init_payload)
@@ -9329,17 +8759,6 @@ def run_draft(
                     total_energy_kwh_per_1m_tokens,
                 )
             )
-        if objective_selection_mode == "constraint":
-            cstats = dict(runner.constraint_fallback_stats)
-            print(
-                "[Constraint Debug] width selected fallback/feasible: {}/{} | nnodes selected fallback/feasible: {}/{}".format(
-                    int(cstats.get("width_selected_fallback", 0)),
-                    int(cstats.get("width_selected_feasible", 0)),
-                    int(cstats.get("nnodes_selected_fallback", 0)),
-                    int(cstats.get("nnodes_selected_feasible", 0)),
-                )
-            )
-        
         # total_algorithm_time total_algorithm_cost
         # algorithm_stats total_algorithm_time 
         total_algorithm_time = algorithm_stats.get("total_algorithm_time", 0.0) if algorithm_stats else 0.0
@@ -9369,18 +8788,7 @@ def run_draft(
                 "user_communication_cost_per_gb": float(user_communication_cost_per_gb),
                 "cloud_outbound_cost_per_gb": float(cloud_outbound_cost_per_gb),
                 "accept_length_margin": float(accept_length_margin),
-                "objective_selection_mode": str(objective_selection_mode),
-                "constraint_target": str(constraint_target),
-                "metric_constraint_per_1m_token": (
-                    float(metric_constraint_per_1m_token)
-                    if metric_constraint_per_1m_token is not None
-                    else None
-                ),
-                "min_tps_constraint": (
-                    float(min_tps_constraint)
-                    if min_tps_constraint is not None
-                    else 0.0
-                ),
+                "objective_selection_mode": "blend",
                 "total_metric_cap": (
                     float(total_metric_cap)
                     if np.isfinite(total_metric_cap)
@@ -9395,22 +8803,7 @@ def run_draft(
                 "reference_feasible_tps": reference_feasible_tps,
                 "reference_cs_anchor_curve": reference_cs_anchor_curve,
                 "reference_tradeoff_curve_cs0_1": reference_tradeoff_curve_cs0_1,
-                "reference_constraint_anchor_curve": reference_constraint_anchor_curve,
-                "reference_tradeoff_curve_by_constraint": reference_tradeoff_curve_by_constraint,
-                "reference_constraint_center_per_1m_token": (
-                    float(auto_reference_constraint_center_per_1m)
-                    if auto_reference_constraint_center_per_1m is not None
-                    else None
-                ),
                 "reference_cs_curve_rounds": int(reference_cs_curve_rounds),
-                "reference_constraint_multipliers": [
-                    float(v) for v in reference_constraint_multipliers_list
-                ],
-                "metric_constraint_source": (
-                    "user"
-                    if user_metric_constraint_provided
-                    else ("auto_blend_cs50" if objective_selection_mode == "constraint" else None)
-                ),
                 "no_draft_cost": bool(no_draft_cost),
                 "opt_tree": opt_tree,
                 "fixed_width": fixed_width,
@@ -9719,7 +9112,6 @@ def run_draft(
                 "metric_spent_total": float(metric_spent_total),
                 "metric_cap_reached": bool(metric_cap_reached),
                 "target_profile_lookup_stats": dict(runner.target_profile_lookup_stats),
-                "constraint_fallback_stats": dict(runner.constraint_fallback_stats),
                 "total_algorithm_time": float(total_algorithm_time),
                 "total_algorithm_cost": float(total_algorithm_cost),
             },
@@ -9865,10 +9257,6 @@ def run_chat_mode(
     user_communication_cost_per_gb: float,
     cloud_outbound_cost_per_gb: float,
     accept_length_margin: float,
-    objective_selection_mode: str,
-    constraint_target: str,
-    metric_constraint_per_1m_token: float,
-    min_tps_constraint: float,
     cost_sensitivity: float,
     min_width: int,
     fixed_depth: bool,
@@ -9924,13 +9312,6 @@ def run_chat_mode(
     target_per_sec_cost = float(target_per_hour_cost) / 3600.0
     if bool(bill_draft_as_target_gpu) and (not bool(no_draft_cost)):
         draft_per_sec_cost = float(target_per_sec_cost)
-    metric_constraint_per_token = (
-        (float(metric_constraint_per_1m_token) / 1_000_000.0)
-        if str(constraint_target).lower() == "metric" and metric_constraint_per_1m_token is not None
-        else None
-    )
-    objective_selection_mode = str(objective_selection_mode).lower()
-    constraint_target = str(constraint_target).lower()
     user_communication_cost_per_gb, cloud_outbound_cost_per_gb = _resolve_cloud_transfer_costs(
         user_communication_cost_per_gb=user_communication_cost_per_gb,
         cloud_outbound_cost_per_gb=cloud_outbound_cost_per_gb,
@@ -10009,10 +9390,6 @@ def run_chat_mode(
         no_draft_cost=no_draft_cost,
         objective_metric=objective_metric,
         accept_length_margin=accept_length_margin,
-        objective_selection_mode=objective_selection_mode,
-        constraint_target=constraint_target,
-        metric_constraint_per_token=metric_constraint_per_token,
-        min_tps_constraint=min_tps_constraint,
         bill_draft_as_target_gpu=bool(bill_draft_as_target_gpu),
     )
     if objective_metric == "total_cost" and (not no_draft_cost) and (not bill_draft_as_target_gpu):
@@ -10050,27 +9427,10 @@ def run_chat_mode(
         online_profile_lr=float(online_profile_lr),
     )
 
-    feasible_constraint_range_per_1m = None
-    feasible_tps_range = None
     reference_tradeoff_curve_cs0_1 = None
-    reference_tradeoff_curve_by_constraint = None
     reference_cs_anchor_curve = None
-    reference_constraint_anchor_curve = None
     try:
-        default_reference_constraint_multipliers = "0.8,1.0,1.2"
-        reference_constraint_multipliers_list = _parse_reference_constraint_multipliers(
-            default_reference_constraint_multipliers
-        )
-        if objective_selection_mode == "constraint":
-            reference_mode_key = (
-                f"{objective_selection_mode}|{constraint_target}|{objective_metric}|auto-center-blendcs50|"
-                + ",".join(f"{v:.6f}" for v in reference_constraint_multipliers_list)
-            )
-        else:
-            reference_mode_key = (
-                f"{objective_selection_mode}|{constraint_target}|{objective_metric}|"
-                + ",".join(f"{v:.6f}" for v in reference_constraint_multipliers_list)
-            )
+        reference_mode_key = f"blend|{objective_metric}"
         reference_cache, _ = load_reference_cache(
             base_model_path=base_model_path,
             draft_model_path=draft_model_path,
@@ -10080,40 +9440,16 @@ def run_chat_mode(
             device_name=device_name,
             target_quantization=target_quantization,
             draft_quantization=draft_quantization,
-            objective_selection_mode=objective_selection_mode,
+            objective_selection_mode="blend",
             reference_mode_key=reference_mode_key,
         )
-        if reference_cache and isinstance(reference_cache.get("feasible_metric_per_token", None), dict):
-            f_min = reference_cache["feasible_metric_per_token"].get("min", None)
-            f_max = reference_cache["feasible_metric_per_token"].get("max", None)
-            if f_min is not None and f_max is not None:
-                feasible_constraint_range_per_1m = {
-                    "min": float(f_min) * 1_000_000.0,
-                    "max": float(f_max) * 1_000_000.0,
-                }
-        if reference_cache and isinstance(reference_cache.get("feasible_tps", None), dict):
-            t_min = reference_cache["feasible_tps"].get("min", None)
-            t_max = reference_cache["feasible_tps"].get("max", None)
-            if t_min is not None and t_max is not None:
-                feasible_tps_range = {
-                    "min": float(t_min),
-                    "max": float(t_max),
-                }
         if reference_cache and isinstance(reference_cache.get("reference_tradeoff_curve_cs0_1", None), list):
             reference_tradeoff_curve_cs0_1 = reference_cache.get("reference_tradeoff_curve_cs0_1")
-        if reference_cache and isinstance(reference_cache.get("reference_tradeoff_curve_by_constraint", None), list):
-            reference_tradeoff_curve_by_constraint = reference_cache.get("reference_tradeoff_curve_by_constraint")
         if reference_cache and isinstance(reference_cache.get("reference_cs_anchor_curve", None), list):
             reference_cs_anchor_curve = reference_cache.get("reference_cs_anchor_curve")
-        if reference_cache and isinstance(reference_cache.get("reference_constraint_anchor_curve", None), list):
-            reference_constraint_anchor_curve = reference_cache.get("reference_constraint_anchor_curve")
     except Exception:
-        feasible_constraint_range_per_1m = None
-        feasible_tps_range = None
         reference_tradeoff_curve_cs0_1 = None
-        reference_tradeoff_curve_by_constraint = None
         reference_cs_anchor_curve = None
-        reference_constraint_anchor_curve = None
 
     conv = _build_conversation_template_for_model(base_model_path)
 
@@ -10204,24 +9540,12 @@ def run_chat_mode(
         )
         _emit({
             "type": "ready",
-            "objective_selection_mode": str(objective_selection_mode),
-            "constraint_target": str(constraint_target),
-            "feasible_constraint_range_per_1m": feasible_constraint_range_per_1m,
-            "feasible_tps_range": feasible_tps_range,
+            "objective_selection_mode": "blend",
             "reference_tradeoff_curve_cs0_1": reference_tradeoff_curve_cs0_1,
-            "reference_tradeoff_curve_by_constraint": reference_tradeoff_curve_by_constraint,
             "reference_cs_anchor_curve": reference_cs_anchor_curve,
-            "reference_constraint_anchor_curve": reference_constraint_anchor_curve,
         })
         active_proactive_drafting = False
         active_chat_max_new_tokens = int(chat_max_new_tokens)
-        active_constraint_target = str(constraint_target)
-        active_metric_constraint_per_1m_token = (
-            float(metric_constraint_per_1m_token) if metric_constraint_per_1m_token is not None else None
-        )
-        active_min_tps_constraint = (
-            float(min_tps_constraint) if min_tps_constraint is not None and float(min_tps_constraint) > 0 else None
-        )
 
         def _emit_status():
             _emit({
@@ -10230,28 +9554,13 @@ def run_chat_mode(
                 "cost_sensitivity": float(runner.cost_sensitivity),
                 "proactive_drafting": bool(active_proactive_drafting),
                 "max_new_tokens": int(active_chat_max_new_tokens),
-                "constraint_target": str(active_constraint_target),
-                "metric_constraint_per_1m_token": (
-                    float(active_metric_constraint_per_1m_token)
-                    if active_metric_constraint_per_1m_token is not None
-                    else None
-                ),
-                "min_tps_constraint": (
-                    float(active_min_tps_constraint)
-                    if active_min_tps_constraint is not None
-                    else 0.0
-                ),
-                "feasible_constraint_range_per_1m": feasible_constraint_range_per_1m,
-                "feasible_tps_range": feasible_tps_range,
                 "reference_tradeoff_curve_cs0_1": reference_tradeoff_curve_cs0_1,
-                "reference_tradeoff_curve_by_constraint": reference_tradeoff_curve_by_constraint,
                 "reference_cs_anchor_curve": reference_cs_anchor_curve,
-                "reference_constraint_anchor_curve": reference_constraint_anchor_curve,
                 "last_line": "ok",
             })
 
         def _apply_set(payload_set: dict, emit_ack: bool = True):
-            nonlocal active_proactive_drafting, active_chat_max_new_tokens, active_constraint_target, active_metric_constraint_per_1m_token, active_min_tps_constraint
+            nonlocal active_proactive_drafting, active_chat_max_new_tokens
             if "cost_sensitivity" in payload_set:
                 try:
                     runner.cost_sensitivity = float(payload_set.get("cost_sensitivity"))
@@ -10264,51 +9573,14 @@ def run_chat_mode(
                     active_chat_max_new_tokens = max(1, int(payload_set.get("max_new_tokens")))
                 except Exception:
                     pass
-            if "constraint_target" in payload_set:
-                incoming_target = str(payload_set.get("constraint_target", active_constraint_target)).lower()
-                if incoming_target in {"metric", "tps"}:
-                    active_constraint_target = incoming_target
-                    runner.constraint_target = incoming_target
-            if "metric_constraint_per_1m_token" in payload_set:
-                try:
-                    active_metric_constraint_per_1m_token = float(payload_set.get("metric_constraint_per_1m_token"))
-                    runner.metric_constraint_per_token = (
-                        float(active_metric_constraint_per_1m_token) / 1_000_000.0
-                        if active_constraint_target == "metric"
-                        else None
-                    )
-                except Exception:
-                    pass
-            if "min_tps_constraint" in payload_set:
-                try:
-                    incoming_min_tps = float(payload_set.get("min_tps_constraint"))
-                    active_min_tps_constraint = incoming_min_tps if incoming_min_tps > 0 else None
-                    runner.min_tps_constraint = active_min_tps_constraint if active_constraint_target == "tps" else None
-                except Exception:
-                    pass
             if emit_ack:
                 _emit({
                     "type": "settings_ack",
                     "cost_sensitivity": float(runner.cost_sensitivity),
                     "proactive_drafting": bool(active_proactive_drafting),
                     "max_new_tokens": int(active_chat_max_new_tokens),
-                    "constraint_target": str(active_constraint_target),
-                    "metric_constraint_per_1m_token": (
-                        float(active_metric_constraint_per_1m_token)
-                        if active_metric_constraint_per_1m_token is not None
-                        else None
-                    ),
-                    "min_tps_constraint": (
-                        float(active_min_tps_constraint)
-                        if active_min_tps_constraint is not None
-                        else 0.0
-                    ),
-                    "feasible_constraint_range_per_1m": feasible_constraint_range_per_1m,
-                    "feasible_tps_range": feasible_tps_range,
                     "reference_tradeoff_curve_cs0_1": reference_tradeoff_curve_cs0_1,
-                    "reference_tradeoff_curve_by_constraint": reference_tradeoff_curve_by_constraint,
                     "reference_cs_anchor_curve": reference_cs_anchor_curve,
-                    "reference_constraint_anchor_curve": reference_constraint_anchor_curve,
                 })
 
         def _poll_live_controls() -> bool:
@@ -10375,28 +9647,6 @@ def run_chat_mode(
             if "max_new_tokens" in payload:
                 try:
                     active_chat_max_new_tokens = max(1, int(payload.get("max_new_tokens")))
-                except Exception:
-                    pass
-            if "constraint_target" in payload:
-                incoming_target = str(payload.get("constraint_target", active_constraint_target)).lower()
-                if incoming_target in {"metric", "tps"}:
-                    active_constraint_target = incoming_target
-                    runner.constraint_target = incoming_target
-            if "metric_constraint_per_1m_token" in payload:
-                try:
-                    active_metric_constraint_per_1m_token = float(payload.get("metric_constraint_per_1m_token"))
-                    runner.metric_constraint_per_token = (
-                        float(active_metric_constraint_per_1m_token) / 1_000_000.0
-                        if active_constraint_target == "metric"
-                        else None
-                    )
-                except Exception:
-                    pass
-            if "min_tps_constraint" in payload:
-                try:
-                    incoming_min_tps = float(payload.get("min_tps_constraint"))
-                    active_min_tps_constraint = incoming_min_tps if incoming_min_tps > 0 else None
-                    runner.min_tps_constraint = active_min_tps_constraint if active_constraint_target == "tps" else None
                 except Exception:
                     pass
             if not user_text:
@@ -10918,12 +10168,8 @@ def run_chat_mode(
                     "reply": decoded,
                     "token_trace": output_trace,
                     "final_stats": final_stats,
-                    "feasible_constraint_range_per_1m": feasible_constraint_range_per_1m,
-                    "feasible_tps_range": feasible_tps_range,
                     "reference_tradeoff_curve_cs0_1": reference_tradeoff_curve_cs0_1,
-                    "reference_tradeoff_curve_by_constraint": reference_tradeoff_curve_by_constraint,
                     "reference_cs_anchor_curve": reference_cs_anchor_curve,
-                    "reference_constraint_anchor_curve": reference_constraint_anchor_curve,
                 })
             except Exception as e:
                 _emit({"type": "error", "message": str(e)})
@@ -11018,19 +10264,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--accept-length-margin", type=float, default=0.05, help="Conservative margin for expected accept length (default: 0.05)")
     parser.add_argument(
-        "--objective-selection-mode",
-        type=str,
-        choices=["blend", "constraint"],
-        default="blend",
-        help="Tree selection mode: blend (current) or constraint (maximize TPS under metric constraint).",
-    )
-    parser.add_argument(
-        "--metric-constraint-per-1m-token",
-        type=float,
-        default=None,
-        help="Constraint mode target metric per 1M tokens. If omitted, auto-inferred from blend(cs=0.5) reference.",
-    )
-    parser.add_argument(
         "--total-metric-cap",
         type=float,
         default=float("inf"),
@@ -11065,13 +10298,6 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Max step rounds per query during reference cache generation (default: 1).",
-    )
-    parser.add_argument(
-        "--reference-constraint-multipliers",
-        type=str,
-        default="0.8,1.0,1.2",
-        help="Constraint-mode reference sweep multipliers (comma-separated). "
-             "Anchors are auto-inferred center metric * multipliers.",
     )
     parser.add_argument("--auto-profile", action="store_true", default=True,
                         help="Draft/Target profile file is missing, auto-generate (default: on)")
@@ -11215,8 +10441,6 @@ if __name__ == "__main__":
         help="Wait for canceled proactive work to fully exit before starting the next main draft tree build.",
     )
     parser.add_argument("--no-draft-cost", action="store_true", default=False, help="Ignore draft tree build cost in objective (latency still used)")
-    parser.add_argument("--min-tps-constraint", type=float, default=0.0, help="Minimum predicted throughput (tok/s) required in constraint mode; 0 disables.")
-    parser.add_argument("--constraint-target", type=str, default="metric", choices=["metric", "tps"], help="Constraint target in constraint mode: metric budget or minimum TPS.")
     parser.add_argument(
         "--objective-metric",
         type=str,
@@ -11350,10 +10574,6 @@ if __name__ == "__main__":
             user_communication_cost_per_gb=args.user_communication_cost_per_gb,
             cloud_outbound_cost_per_gb=args.cloud_outbound_cost_per_gb,
             accept_length_margin=args.accept_length_margin,
-            objective_selection_mode=args.objective_selection_mode,
-            constraint_target=args.constraint_target,
-            metric_constraint_per_1m_token=args.metric_constraint_per_1m_token,
-            min_tps_constraint=args.min_tps_constraint,
             cost_sensitivity=args.cost_sensitivity,
             min_width=args.min_width,
             fixed_depth=args.fixed_depth,
@@ -11402,10 +10622,6 @@ if __name__ == "__main__":
             user_communication_cost_per_gb=args.user_communication_cost_per_gb,
             cloud_outbound_cost_per_gb=args.cloud_outbound_cost_per_gb,
             accept_length_margin=args.accept_length_margin,
-            objective_selection_mode=args.objective_selection_mode,
-            constraint_target=args.constraint_target,
-            metric_constraint_per_1m_token=args.metric_constraint_per_1m_token,
-            min_tps_constraint=args.min_tps_constraint,
             total_metric_cap=args.total_metric_cap,
             cost_sensitivity=args.cost_sensitivity,
             opt_tree=args.opt_tree,
@@ -11456,7 +10672,6 @@ if __name__ == "__main__":
             reference_test_output_json=args.reference_test_output_json,
             reference_cs_curve_rounds=args.reference_cs_curve_rounds,
             reference_max_steps_limit=args.reference_max_steps_limit,
-            reference_constraint_multipliers=args.reference_constraint_multipliers,
             reference_force_refresh=args.reference_force_refresh,
             tokenizer_path=args.tokenizer_path,
             auto_target_profile=auto_profile,

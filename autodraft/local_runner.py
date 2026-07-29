@@ -533,8 +533,6 @@ def run_local(
         user_communication_cost_per_gb=2.3333333333,
         accept_length_margin=0.05,
         objective_metric=cost_metric,
-        objective_selection_mode="blend",
-        constraint_target="metric",
         cost_sensitivity=cs_value,
         online_profile_update=True,
         online_profile_lr=0.05,
@@ -619,7 +617,7 @@ def run_local(
             draft_quantization=_normalize_quantization(draft_quantization),
             bench_name=str(filtered.get("bench_name", "mt_bench")),
             cost_metric=cost_metric,
-            objective_mode=str(filtered.get("objective_selection_mode", "blend")),
+            objective_mode="blend",
         )
         target_dir = Path(tradeoff_dir) if tradeoff_dir else Path(os.environ["AUTODRAFT_DATA_DIR"]) / "tradeoff"
         try:

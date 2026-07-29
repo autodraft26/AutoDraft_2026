@@ -101,6 +101,12 @@ result = engine.run(
 - Python 3.10 or newer
 - `git`
 
+> **Note (Llama 3.3):** When running **Llama 3.3** models (e.g. `meta-llama/Llama-3.3-70B-Instruct`), install `transformers==4.48.3` instead of the version pinned in `requirements.txt` (`transformers==5.5.0`). Newer `transformers` releases can fail with Llama 3.3 checkpoints in this codebase.
+>
+> ```bash
+> pip install transformers==4.48.3
+> ```
+
 ### 2.2 Installation
 
 **2.2.1 Get the project**

@@ -83,8 +83,7 @@ def _help_text(mode: str) -> str:
             "- Clicking points on the trade-off chart syncs server/model selection.\n"
             "\n"
             "[Runtime Tuning]\n"
-            "- Objective Selection: balanced(blend) / constraint\n"
-            "- Use Cost Sensitivity or Constraint slider to adjust trade-off behavior.\n"
+            "- Use the Cost Sensitivity slider to adjust trade-off behavior.\n"
             "- `Refresh Cache` recomputes/reloads reference cache.\n"
             "\n"
             "[Troubleshooting]\n"
@@ -141,11 +140,7 @@ async def ws_endpoint(ws: WebSocket):
         "draft_quantization": "none",
         "cost": 0.15,
         "max_new_tokens": 512,
-        "objective_selection_mode": "blend",
         "metric_preference": "total_cost",
-        "constraint_target": "metric",
-        "metric_constraint_per_1m_token": 14.0,
-        "min_tps_constraint": 0.0,
         "algorithm": "AutoDraft",
         "draft_model_path": "meta-llama/Llama-3.2-3B-Instruct",
         "benchmark_dataset": "mt_bench",
@@ -174,22 +169,10 @@ async def ws_endpoint(ws: WebSocket):
                     settings["target_quantization"] = tq if tq in {"none", "4bit", "8bit"} else "none"
                     dq = str(payload.get("draft_quantization", settings["draft_quantization"])).lower()
                     settings["draft_quantization"] = dq if dq in {"none", "4bit", "8bit"} else "none"
-                    settings["cost"] = int(payload.get("cost", settings["cost"]))
+                    settings["cost"] = float(payload.get("cost", settings["cost"]))
                     settings["max_new_tokens"] = int(payload.get("max_new_tokens", settings["max_new_tokens"]))
-                    obj_mode = str(payload.get("objective_selection_mode", settings["objective_selection_mode"])).lower()
-                    settings["objective_selection_mode"] = "constraint" if obj_mode == "constraint" else "blend"
                     settings["metric_preference"] = str(
                         payload.get("metric_preference", settings["metric_preference"])
-                    )
-                    constraint_target = str(
-                        payload.get("constraint_target", settings["constraint_target"])
-                    ).lower()
-                    settings["constraint_target"] = "tps" if constraint_target == "tps" else "metric"
-                    settings["metric_constraint_per_1m_token"] = float(
-                        payload.get("metric_constraint_per_1m_token", settings["metric_constraint_per_1m_token"])
-                    )
-                    settings["min_tps_constraint"] = float(
-                        payload.get("min_tps_constraint", settings["min_tps_constraint"])
                     )
                     settings["algorithm"] = payload.get("algorithm", settings["algorithm"])
                     settings["draft_model_path"] = payload.get("draft_model_path", settings["draft_model_path"])
@@ -217,11 +200,7 @@ async def ws_endpoint(ws: WebSocket):
                         "draft_quantization": settings["draft_quantization"],
                         "cost": settings["cost"],
                         "max_new_tokens": settings["max_new_tokens"],
-                        "objective_selection_mode": settings["objective_selection_mode"],
                         "metric_preference": settings["metric_preference"],
-                        "constraint_target": settings["constraint_target"],
-                        "metric_constraint_per_1m_token": settings["metric_constraint_per_1m_token"],
-                        "min_tps_constraint": settings["min_tps_constraint"],
                         "algorithm": settings["algorithm"],
                         "draft_model_path": settings["draft_model_path"],
                         "benchmark_dataset": settings["benchmark_dataset"],
@@ -325,20 +304,8 @@ async def ws_endpoint(ws: WebSocket):
                         continue
 
                     server = payload.get("server", settings["server"])
-                    cost = int(payload.get("cost", settings["cost"]))
+                    cost = float(payload.get("cost", settings["cost"]))
                     max_new_tokens = int(payload.get("max_new_tokens", settings["max_new_tokens"]))
-                    obj_mode = str(payload.get("objective_selection_mode", settings["objective_selection_mode"])).lower()
-                    objective_selection_mode = "constraint" if obj_mode == "constraint" else "blend"
-                    constraint_target = str(
-                        payload.get("constraint_target", settings["constraint_target"])
-                    ).lower()
-                    constraint_target = "tps" if constraint_target == "tps" else "metric"
-                    metric_constraint_per_1m_token = float(
-                        payload.get("metric_constraint_per_1m_token", settings["metric_constraint_per_1m_token"])
-                    )
-                    min_tps_constraint = float(
-                        payload.get("min_tps_constraint", settings["min_tps_constraint"])
-                    )
                     algorithm = payload.get("algorithm", settings["algorithm"])
                     benchmark_dataset = str(
                         payload.get("benchmark_dataset", settings["benchmark_dataset"])
@@ -354,20 +321,12 @@ async def ws_endpoint(ws: WebSocket):
                         "server": server,
                         "cost": cost,
                         "max_new_tokens": max_new_tokens,
-                        "objective_selection_mode": objective_selection_mode,
-                        "constraint_target": constraint_target,
-                        "metric_constraint_per_1m_token": metric_constraint_per_1m_token,
-                        "min_tps_constraint": min_tps_constraint,
                         "algorithm": algorithm,
                         "benchmark_dataset": benchmark_dataset,
                         "proactive_drafting": proactive_drafting,
                         "mode": settings["mode"],
                     })
                     settings["max_new_tokens"] = max_new_tokens
-                    settings["objective_selection_mode"] = objective_selection_mode
-                    settings["constraint_target"] = constraint_target
-                    settings["metric_constraint_per_1m_token"] = metric_constraint_per_1m_token
-                    settings["min_tps_constraint"] = min_tps_constraint
                     settings["benchmark_dataset"] = benchmark_dataset
 
                     text = user_text.lower().strip()
@@ -442,11 +401,8 @@ async def ws_endpoint(ws: WebSocket):
                                         "phase_label": str(snap_now.get("phase_label", "Idle")),
                                         "last_line": str(snap_now.get("last_line", "")),
                                         "last_error": str(snap_now.get("last_error", "")),
-                                        "feasible_constraint_range_per_1m": snap_now.get("feasible_constraint_range_per_1m"),
                                         "reference_tradeoff_curve_cs0_1": snap_now.get("reference_tradeoff_curve_cs0_1"),
-                                        "reference_tradeoff_curve_by_constraint": snap_now.get("reference_tradeoff_curve_by_constraint"),
                                         "reference_cs_anchor_curve": snap_now.get("reference_cs_anchor_curve"),
-                                        "reference_constraint_anchor_curve": snap_now.get("reference_constraint_anchor_curve"),
                                         "server_candidates": snap_now.get("server_candidates"),
                                         "probe_status": snap_now.get("probe_status"),
                                         "server_probe_rows": snap_now.get("server_probe_rows"),
@@ -522,11 +478,8 @@ async def send_stats_periodically(ws: WebSocket):
                 "phase_label": str(snap.get("phase_label", "Idle")),
                 "last_line": str(snap.get("last_line", "")),
                 "last_error": str(snap.get("last_error", "")),
-                "feasible_constraint_range_per_1m": snap.get("feasible_constraint_range_per_1m"),
                 "reference_tradeoff_curve_cs0_1": snap.get("reference_tradeoff_curve_cs0_1"),
-                "reference_tradeoff_curve_by_constraint": snap.get("reference_tradeoff_curve_by_constraint"),
                 "reference_cs_anchor_curve": snap.get("reference_cs_anchor_curve"),
-                "reference_constraint_anchor_curve": snap.get("reference_constraint_anchor_curve"),
                 "server_candidates": snap.get("server_candidates"),
                 "probe_status": snap.get("probe_status"),
                 "server_probe_rows": snap.get("server_probe_rows"),

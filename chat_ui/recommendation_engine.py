@@ -32,8 +32,7 @@ def pareto_optimal_rows(rows: List[Dict], metric_key: str = "metric_per_1m") -> 
 
 
 def _extract_metric(row: Dict, objective_mode: str, metric_preference: str) -> Optional[float]:
-    # blend: prioritize api cost metric if available.
-    # constraint: same metric key but supports future extension.
+    # blend mode: pick the metric key based on the selected metric preference.
     if metric_preference == "total_cost":
         val = row.get("total_cost_per_1m")
         if val is None:

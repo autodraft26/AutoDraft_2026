@@ -94,13 +94,6 @@
 
         <div class="top-grid two">
           <div class="field">
-            <div class="panel-title">Objective Selection</div>
-            <select id="objectiveModeSelect" class="panel-select narrow-select">
-              <option value="balanced" selected>Balanced (blend)</option>
-              <option value="constraint">Constraint</option>
-            </select>
-          </div>
-          <div class="field">
             <div class="panel-title">Metric Preference</div>
             <select id="metricPreferenceSelect" class="panel-select narrow-select">
               <option value="total_cost" selected>Total Cost (Draft + Target + Comm / 1M)</option>
@@ -109,9 +102,6 @@
               <option value="target_energy">Target Energy Only</option>
             </select>
           </div>
-        </div>
-
-        <div class="top-grid two">
           <div class="field" id="costControlGroup">
             <div class="panel-title">Cost Sensitivity</div>
             <div class="slider-row narrow-slider-row">
@@ -119,29 +109,9 @@
               <div id="costValue" class="cost-value">0.15</div>
             </div>
           </div>
-          <div class="field" id="constraintTargetControlGroup" style="display:none;">
-            <div class="panel-title">Constraint Target</div>
-            <select id="constraintTargetSelect">
-              <option value="metric">Metric Budget</option>
-              <option value="tps">Minimum Throughput</option>
-            </select>
-          </div>
-          <div class="field" id="constraintControlGroup" style="display:none;">
-            <div class="panel-title">Constraint [$ / 1M tok]</div>
-            <div class="slider-row narrow-slider-row">
-              <input id="constraintSlider" type="range" min="1" max="30" step="0.1" value="14.0" />
-              <div id="constraintValue" class="cost-value">14.0</div>
-            </div>
-            <div id="constraintHint" class="constraint-hint">Feasible range loading...</div>
-          </div>
-          <div class="field" id="tpsConstraintControlGroup" style="display:none;">
-            <div class="panel-title">Min Throughput [tok/s]</div>
-            <div class="slider-row narrow-slider-row">
-              <input id="tpsConstraintSlider" type="range" min="0" max="100" step="0.5" value="0.0" />
-              <div id="tpsConstraintValue" class="cost-value">0.0</div>
-            </div>
-            <div id="tpsConstraintHint" class="constraint-hint">0 disables the TPS floor.</div>
-          </div>
+        </div>
+
+        <div class="top-grid two">
           <div class="field">
             <div class="panel-title-row">
               <div class="panel-title">Control</div>
@@ -153,6 +123,7 @@
               <button id="shutdownTargetBtn" class="control-btn danger" type="button">Shutdown</button>
             </div>
           </div>
+          <div class="field"></div>
         </div>
       </div>
 
@@ -162,7 +133,7 @@
           <div class="row-btns">
             <button id="refreshReferenceBtn" class="mini-btn">
               Profile LLM
-              <span class="btn-help" data-tooltip="Profiles the currently selected LLM setup and updates the reference trade-off curve for the selected objective mode.">
+              <span class="btn-help" data-tooltip="Profiles the currently selected LLM setup and updates the reference trade-off curve for the current Cost Sensitivity setting.">
                 ?
               </span>
             </button>

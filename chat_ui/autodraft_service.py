@@ -38,6 +38,7 @@ DETAILED_TARGET_PROFILE_NODE_LIST = (
 
 TARGET_DRAFT_COMPATIBILITY = {
     "meta-llama/llama-3.3-70b-instruct": {
+        "meta-llama/llama-3.1-8b-instruct",
         "meta-llama/llama-3.2-3b-instruct",
         "meta-llama/llama-3.2-1b-instruct",
     },
@@ -51,8 +52,10 @@ TARGET_DRAFT_COMPATIBILITY = {
     },
     "qwen/qwen3-32b": {
         "qwen/qwen3-0.6b",
+        "qwen/qwen3-1.7b",
     },
     "qwen/qwen3-14b": {
+        "qwen/qwen3-1.7b",
         "qwen/qwen3-0.6b",
     },
 }
@@ -64,6 +67,8 @@ def _canonical_model_key(model_id: str) -> str:
         return ""
     if "llama-3.3-70b-instruct" in raw:
         return "meta-llama/llama-3.3-70b-instruct"
+    if "llama-3.1-8b-instruct" in raw:
+        return "meta-llama/llama-3.1-8b-instruct"
     if "llama-3.2-3b-instruct" in raw:
         return "meta-llama/llama-3.2-3b-instruct"
     if "llama-3.2-1b-instruct" in raw:
@@ -82,6 +87,8 @@ def _canonical_model_key(model_id: str) -> str:
         return "qwen/qwen3-32b"
     if "qwen3-14b" in raw:
         return "qwen/qwen3-14b"
+    if "qwen3-1.7b" in raw:
+        return "qwen/qwen3-1.7b"
     if "qwen3-0.6b" in raw:
         return "qwen/qwen3-0.6b"
     return raw
@@ -142,12 +149,8 @@ class AutoDraftService:
         self.phase = "idle"
         self.phase_label = "Idle"
         self.chat_ready = False
-        self.feasible_constraint_range_per_1m = None
-        self.feasible_tps_range = None
         self.reference_tradeoff_curve_cs0_1 = None
-        self.reference_tradeoff_curve_by_constraint = None
         self.reference_cs_anchor_curve = None
-        self.reference_constraint_anchor_curve = None
         self.current_settings: Dict = {}
         self.stats = {
             "gpu_energy": 0.0,
@@ -173,12 +176,8 @@ class AutoDraftService:
 
     def _reset_tradeoff_state(self):
         # Clear all trade-off/reference/probe artifacts after explicit stop.
-        self.feasible_constraint_range_per_1m = None
-        self.feasible_tps_range = None
         self.reference_tradeoff_curve_cs0_1 = None
-        self.reference_tradeoff_curve_by_constraint = None
         self.reference_cs_anchor_curve = None
-        self.reference_constraint_anchor_curve = None
         self.probe_rows = []
         self.probe_curves = []
         self.probe_status = {"running": False, "last_error": "", "updated_at": time.time()}
@@ -233,8 +232,6 @@ class AutoDraftService:
                 "algorithm": settings.get("algorithm"),
                 "draft_model_path": settings.get("draft_model_path"),
                 "objective_metric": self._objective_metric_from_settings(settings),
-                "objective_selection_mode": settings.get("objective_selection_mode", "blend"),
-                "constraint_target": settings.get("constraint_target", "metric"),
                 "selected_server_id": settings.get("selected_server_id"),
                 "selected_model_id": settings.get("selected_model_id"),
                 "target_quantization": settings.get("target_quantization", "none"),
@@ -867,13 +864,7 @@ class AutoDraftService:
         proactive = bool(settings.get("proactive_drafting", False))
         if algorithm in {"Server-Only", "Server-Only-AR"}:
             proactive = False
-        objective_mode = str(settings.get("objective_selection_mode", "blend")).lower()
-        objective_mode = "constraint" if objective_mode == "constraint" else "blend"
-        constraint_target = str(settings.get("constraint_target", "metric")).lower()
-        constraint_target = "tps" if constraint_target == "tps" else "metric"
         objective_metric = self._objective_metric_from_settings(settings)
-        metric_constraint_per_1m_token = float(settings.get("metric_constraint_per_1m_token", 14.0))
-        min_tps_constraint = float(settings.get("min_tps_constraint", 0.0) or 0.0)
         online_profile_update = bool(settings.get("online_profile_update", True))
         try:
             online_profile_lr = float(settings.get("online_profile_lr", 0.05))
@@ -942,10 +933,6 @@ class AutoDraftService:
             "4",
             "--objective-metric",
             objective_metric,
-            "--objective-selection-mode",
-            objective_mode,
-            "--constraint-target",
-            constraint_target,
             "--cost-sensitivity",
             str(cs),
             "--online-profile-lr",
@@ -994,11 +981,6 @@ class AutoDraftService:
             cmd.extend(["--fixed-depth", "--fixed-nnodes", "--fixed-width"])
         if tokenizer_model:
             cmd.extend(["--tokenizer-path", tokenizer_model])
-        if objective_mode == "constraint":
-            if constraint_target == "metric":
-                cmd.extend(["--metric-constraint-per-1m-token", str(metric_constraint_per_1m_token)])
-            elif min_tps_constraint > 0:
-                cmd.extend(["--min-tps-constraint", str(min_tps_constraint)])
         return cmd
 
     def _build_benchmark_command(self, settings: Dict) -> list[str]:
@@ -1054,8 +1036,7 @@ class AutoDraftService:
             server_name = resolved["server_name"]
             metric = self._objective_metric_from_settings(settings)
             bench = self._benchmark_dataset_from_settings(settings)
-            objective_mode = str(settings.get("objective_selection_mode", "blend")).lower()
-            objective_mode = "constraint" if objective_mode == "constraint" else "blend"
+            objective_mode = "blend"
             target_quantization = _normalize_quantization_mode(settings.get("target_quantization", "none"), default="none")
             draft_quantization = _normalize_quantization_mode(settings.get("draft_quantization", "none"), default="none")
             pattern = (
@@ -1088,22 +1069,12 @@ class AutoDraftService:
         except Exception:
             return None
 
-    def _curve_points_from_reference_payload(self, payload: Optional[Dict], objective_mode: str) -> List[Dict]:
+    def _curve_points_from_reference_payload(self, payload: Optional[Dict], objective_mode: str = "blend") -> List[Dict]:
         if not isinstance(payload, dict):
             return []
-        mode = "constraint" if str(objective_mode).lower() == "constraint" else "blend"
-        constraint_target = str(payload.get("constraint_target", "metric")).lower()
-        if constraint_target not in {"metric", "tps"}:
-            constraint_target = "metric"
-        rows = []
-        if mode == "constraint":
-            rows = payload.get("reference_tradeoff_curve_by_constraint")
-            if not isinstance(rows, list) or not rows:
-                rows = payload.get("reference_constraint_anchor_curve")
-        else:
-            rows = payload.get("reference_tradeoff_curve_cs0_1")
-            if not isinstance(rows, list) or not rows:
-                rows = payload.get("reference_cs_anchor_curve")
+        rows = payload.get("reference_tradeoff_curve_cs0_1")
+        if not isinstance(rows, list) or not rows:
+            rows = payload.get("reference_cs_anchor_curve")
         if not isinstance(rows, list):
             return []
         points = []
@@ -1111,13 +1082,7 @@ class AutoDraftService:
             if not isinstance(r, dict):
                 continue
             try:
-                if mode == "constraint":
-                    if constraint_target == "tps":
-                        selector = float(r.get("min_tps_constraint", r.get("predicted_tps")))
-                    else:
-                        selector = float(r.get("metric_constraint_per_1m_token"))
-                else:
-                    selector = float(r.get("cost_sensitivity"))
+                selector = float(r.get("cost_sensitivity"))
                 metric_per_1m = float(
                     r.get(
                         "predicted_metric_per_1m_token",
@@ -1142,13 +1107,10 @@ class AutoDraftService:
             )
         return points
 
-    def _curve_points_from_runtime_state(self, objective_mode: str) -> List[Dict]:
+    def _curve_points_from_runtime_state(self, objective_mode: str = "blend") -> List[Dict]:
         payload = {
-            "constraint_target": self.current_settings.get("constraint_target", "metric"),
             "reference_tradeoff_curve_cs0_1": self.reference_tradeoff_curve_cs0_1,
-            "reference_tradeoff_curve_by_constraint": self.reference_tradeoff_curve_by_constraint,
             "reference_cs_anchor_curve": self.reference_cs_anchor_curve,
-            "reference_constraint_anchor_curve": self.reference_constraint_anchor_curve,
         }
         return self._curve_points_from_reference_payload(payload, objective_mode)
 
@@ -1156,35 +1118,11 @@ class AutoDraftService:
         try:
             data = self._read_latest_reference_payload(settings)
             if not isinstance(data, dict):
-                self.feasible_constraint_range_per_1m = None
-                self.feasible_tps_range = None
                 self.reference_tradeoff_curve_cs0_1 = None
-                self.reference_tradeoff_curve_by_constraint = None
                 return
-            fm = data.get("feasible_metric_per_token")
-            if isinstance(fm, dict) and fm.get("min") is not None and fm.get("max") is not None:
-                self.feasible_constraint_range_per_1m = {
-                    "min": float(fm["min"]) * 1_000_000.0,
-                    "max": float(fm["max"]) * 1_000_000.0,
-                }
-            else:
-                self.feasible_constraint_range_per_1m = None
-            ft = data.get("feasible_tps")
-            if isinstance(ft, dict) and ft.get("min") is not None and ft.get("max") is not None:
-                self.feasible_tps_range = {
-                    "min": float(ft["min"]),
-                    "max": float(ft["max"]),
-                }
-            else:
-                self.feasible_tps_range = None
             self.reference_tradeoff_curve_cs0_1 = (
                 data.get("reference_tradeoff_curve_cs0_1")
                 if isinstance(data.get("reference_tradeoff_curve_cs0_1"), list)
-                else None
-            )
-            self.reference_tradeoff_curve_by_constraint = (
-                data.get("reference_tradeoff_curve_by_constraint")
-                if isinstance(data.get("reference_tradeoff_curve_by_constraint"), list)
                 else None
             )
             self.reference_cs_anchor_curve = (
@@ -1192,18 +1130,9 @@ class AutoDraftService:
                 if isinstance(data.get("reference_cs_anchor_curve"), list)
                 else None
             )
-            self.reference_constraint_anchor_curve = (
-                data.get("reference_constraint_anchor_curve")
-                if isinstance(data.get("reference_constraint_anchor_curve"), list)
-                else None
-            )
         except Exception:
-            self.feasible_constraint_range_per_1m = None
-            self.feasible_tps_range = None
             self.reference_tradeoff_curve_cs0_1 = None
-            self.reference_tradeoff_curve_by_constraint = None
             self.reference_cs_anchor_curve = None
-            self.reference_constraint_anchor_curve = None
 
     def _parse_answer_file(self, answer_file: Path) -> Optional[str]:
         if not answer_file.exists():
@@ -1279,32 +1208,10 @@ class AutoDraftService:
                 self.chat_ready = True
                 self.phase = "chat_ready"
                 self.phase_label = "Chat ready"
-                f_range = payload.get("feasible_constraint_range_per_1m", None)
-                if isinstance(f_range, dict):
-                    try:
-                        self.feasible_constraint_range_per_1m = {
-                            "min": float(f_range.get("min")),
-                            "max": float(f_range.get("max")),
-                        }
-                    except Exception:
-                        self.feasible_constraint_range_per_1m = None
-                tps_range = payload.get("feasible_tps_range", None)
-                if isinstance(tps_range, dict):
-                    try:
-                        self.feasible_tps_range = {
-                            "min": float(tps_range.get("min")),
-                            "max": float(tps_range.get("max")),
-                        }
-                    except Exception:
-                        self.feasible_tps_range = None
                 t_curve_cs = payload.get("reference_tradeoff_curve_cs0_1", None)
                 self.reference_tradeoff_curve_cs0_1 = t_curve_cs if isinstance(t_curve_cs, list) else None
-                t_curve_cons = payload.get("reference_tradeoff_curve_by_constraint", None)
-                self.reference_tradeoff_curve_by_constraint = t_curve_cons if isinstance(t_curve_cons, list) else None
                 cs_anchor = payload.get("reference_cs_anchor_curve", None)
                 self.reference_cs_anchor_curve = cs_anchor if isinstance(cs_anchor, list) else None
-                cons_anchor = payload.get("reference_constraint_anchor_curve", None)
-                self.reference_constraint_anchor_curve = cons_anchor if isinstance(cons_anchor, list) else None
             elif p_type == "error":
                 self.phase = "chat_error"
                 self.phase_label = "Chat error"
@@ -1337,36 +1244,12 @@ class AutoDraftService:
                             self.stats["throughput"] = float(final_stats.get("throughput", self.stats["throughput"]))
                     except Exception:
                         pass
-                f_range = payload.get("feasible_constraint_range_per_1m", None)
-                if isinstance(f_range, dict):
-                    try:
-                        self.feasible_constraint_range_per_1m = {
-                            "min": float(f_range.get("min")),
-                            "max": float(f_range.get("max")),
-                        }
-                    except Exception:
-                        self.feasible_constraint_range_per_1m = None
-                tps_range = payload.get("feasible_tps_range", None)
-                if isinstance(tps_range, dict):
-                    try:
-                        self.feasible_tps_range = {
-                            "min": float(tps_range.get("min")),
-                            "max": float(tps_range.get("max")),
-                        }
-                    except Exception:
-                        self.feasible_tps_range = None
                 t_curve_cs = payload.get("reference_tradeoff_curve_cs0_1", None)
                 if isinstance(t_curve_cs, list):
                     self.reference_tradeoff_curve_cs0_1 = t_curve_cs
-                t_curve_cons = payload.get("reference_tradeoff_curve_by_constraint", None)
-                if isinstance(t_curve_cons, list):
-                    self.reference_tradeoff_curve_by_constraint = t_curve_cons
                 cs_anchor = payload.get("reference_cs_anchor_curve", None)
                 if isinstance(cs_anchor, list):
                     self.reference_cs_anchor_curve = cs_anchor
-                cons_anchor = payload.get("reference_constraint_anchor_curve", None)
-                if isinstance(cons_anchor, list):
-                    self.reference_constraint_anchor_curve = cons_anchor
             await self._chat_queue.put(payload)
 
     async def _run(self, settings: Dict):
@@ -1515,26 +1398,13 @@ class AutoDraftService:
                 # Prefer in-memory curve already reported by chat runtime; if missing, try disk cache.
                 has_curve_in_memory = bool(
                     (isinstance(self.reference_tradeoff_curve_cs0_1, list) and len(self.reference_tradeoff_curve_cs0_1) > 0)
-                    or (isinstance(self.reference_tradeoff_curve_by_constraint, list) and len(self.reference_tradeoff_curve_by_constraint) > 0)
                     or (isinstance(self.reference_cs_anchor_curve, list) and len(self.reference_cs_anchor_curve) > 0)
-                    or (
-                        isinstance(self.reference_constraint_anchor_curve, list)
-                        and len(self.reference_constraint_anchor_curve) > 0
-                    )
                 )
                 if not has_curve_in_memory:
                     self._load_tradeoff_from_latest_reference(settings)
                     has_curve_in_memory = bool(
                         (isinstance(self.reference_tradeoff_curve_cs0_1, list) and len(self.reference_tradeoff_curve_cs0_1) > 0)
-                        or (
-                            isinstance(self.reference_tradeoff_curve_by_constraint, list)
-                            and len(self.reference_tradeoff_curve_by_constraint) > 0
-                        )
                         or (isinstance(self.reference_cs_anchor_curve, list) and len(self.reference_cs_anchor_curve) > 0)
-                        or (
-                            isinstance(self.reference_constraint_anchor_curve, list)
-                            and len(self.reference_constraint_anchor_curve) > 0
-                        )
                     )
                 if has_curve_in_memory:
                     self.phase = "reference_done"
@@ -1689,23 +1559,13 @@ class AutoDraftService:
             # Auto-prime reference cache on first Start when no reusable curve exists.
             has_reference_curve = bool(
                 (isinstance(self.reference_tradeoff_curve_cs0_1, list) and len(self.reference_tradeoff_curve_cs0_1) > 0)
-                or (isinstance(self.reference_tradeoff_curve_by_constraint, list) and len(self.reference_tradeoff_curve_by_constraint) > 0)
                 or (isinstance(self.reference_cs_anchor_curve, list) and len(self.reference_cs_anchor_curve) > 0)
-                or (
-                    isinstance(self.reference_constraint_anchor_curve, list)
-                    and len(self.reference_constraint_anchor_curve) > 0
-                )
             )
             if not has_reference_curve:
                 self._load_tradeoff_from_latest_reference(settings)
                 has_reference_curve = bool(
                     (isinstance(self.reference_tradeoff_curve_cs0_1, list) and len(self.reference_tradeoff_curve_cs0_1) > 0)
-                    or (isinstance(self.reference_tradeoff_curve_by_constraint, list) and len(self.reference_tradeoff_curve_by_constraint) > 0)
                     or (isinstance(self.reference_cs_anchor_curve, list) and len(self.reference_cs_anchor_curve) > 0)
-                    or (
-                        isinstance(self.reference_constraint_anchor_curve, list)
-                        and len(self.reference_constraint_anchor_curve) > 0
-                    )
                 )
             if not has_reference_curve:
                 self.phase = "reference_refresh"
@@ -1866,11 +1726,6 @@ class AutoDraftService:
             "cost_sensitivity": float(settings.get("cost", 0.15)),
             "max_new_tokens": int(settings.get("max_new_tokens", 512)),
             "proactive_drafting": bool(settings.get("proactive_drafting", False)),
-            "constraint_target": str(settings.get("constraint_target", "metric")),
-            "metric_constraint_per_1m_token": float(
-                settings.get("metric_constraint_per_1m_token", 14.0)
-            ),
-            "min_tps_constraint": float(settings.get("min_tps_constraint", 0.0) or 0.0),
         }
         try:
             async with self._chat_stdin_lock:
@@ -1954,33 +1809,15 @@ class AutoDraftService:
         payload = payload or {}
         selected = payload.get("server_ids")
         model_overrides = payload.get("model_overrides") if isinstance(payload.get("model_overrides"), dict) else {}
-        objective_mode = str(settings.get("objective_selection_mode", "blend")).lower()
-        objective_mode = "constraint" if objective_mode == "constraint" else "blend"
-        curve_mode = "constraint" if objective_mode == "constraint" else "cost_sensitivity"
+        objective_mode = "blend"
+        curve_mode = "cost_sensitivity"
         metric_preference = str(payload.get("metric_preference") or self.metric_preference or "total_cost")
         self.metric_preference = metric_preference
 
         servers = self.registry.list_servers()
         selected_set = set(selected) if isinstance(selected, list) else None
 
-        if objective_mode == "constraint":
-            constraint_target = str(settings.get("constraint_target", "metric")).lower()
-            if constraint_target == "tps":
-                center = float(settings.get("min_tps_constraint", 0.0) or 0.0)
-                if center <= 0:
-                    center = float(self.stats.get("throughput", 0.0) or 0.0)
-                if center <= 0:
-                    center = 10.0
-                low = max(0.1, center * 0.7)
-                high = max(low + 0.1, center * 1.3)
-                curve_selectors = [low, (low + center) / 2.0, center, (high + center) / 2.0, high]
-            else:
-                center = float(settings.get("metric_constraint_per_1m_token", 14.0))
-                low = max(0.1, center * 0.7)
-                high = max(low + 0.1, center * 1.3)
-                curve_selectors = [low, (low + center) / 2.0, center, (high + center) / 2.0, high]
-        else:
-            curve_selectors = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
+        curve_selectors = [0.0, 0.2, 0.4, 0.6, 0.8, 1.0]
         curve_selectors = [float(v) for v in curve_selectors]
 
         request = ProbeRequest(
@@ -2030,11 +1867,6 @@ class AutoDraftService:
             # Priority 2: reference cache on disk (Profile LLM result).
             if not curve_points:
                 cached_payload = self._read_latest_reference_payload(candidate_settings)
-                if isinstance(cached_payload, dict):
-                    cached_payload = {
-                        **cached_payload,
-                        "constraint_target": candidate_settings.get("constraint_target", "metric"),
-                    }
                 curve_points = self._curve_points_from_reference_payload(cached_payload, objective_mode)
                 if curve_points:
                     curve_source = "reference_cache"
@@ -2072,13 +1904,7 @@ class AutoDraftService:
                     }
                 )
                 # Recommendation is based on current selector on each server curve.
-                if objective_mode == "constraint":
-                    if str(settings.get("constraint_target", "metric")).lower() == "tps":
-                        current_selector = float(settings.get("min_tps_constraint", 0.0) or 0.0)
-                    else:
-                        current_selector = float(settings.get("metric_constraint_per_1m_token", 14.0))
-                else:
-                    current_selector = float(settings.get("cost", 0.15))
+                current_selector = float(settings.get("cost", 0.15))
                 nearest = min(curve_points, key=lambda p: abs(float(p.get("selector_value", 0.0)) - current_selector))
                 rows.append(
                     {
@@ -2110,8 +1936,7 @@ class AutoDraftService:
         }
 
     async def update_recommendations(self, settings: Dict, metric_preference: str) -> Dict:
-        objective_mode = str(settings.get("objective_selection_mode", "blend")).lower()
-        objective_mode = "constraint" if objective_mode == "constraint" else "blend"
+        objective_mode = "blend"
         self.metric_preference = metric_preference or self.metric_preference
         scored, summary = build_recommendations(
             list(self.probe_rows), objective_mode, self.metric_preference
@@ -2224,9 +2049,6 @@ class AutoDraftService:
                 "text": user_text,
                 "cost_sensitivity": float(settings.get("cost", 0.15)),
                 "max_new_tokens": int(settings.get("max_new_tokens", 512)),
-                "constraint_target": str(settings.get("constraint_target", "metric")),
-                "metric_constraint_per_1m_token": float(settings.get("metric_constraint_per_1m_token", 14.0)),
-                "min_tps_constraint": float(settings.get("min_tps_constraint", 0.0) or 0.0),
                 "proactive_drafting": bool(settings.get("proactive_drafting", False)),
             }
             async with self._chat_stdin_lock:
@@ -2287,14 +2109,9 @@ class AutoDraftService:
                 "result_json": self.last_result_json,
                 "phase": self.phase,
                 "phase_label": self.phase_label,
-                "constraint_target": self.current_settings.get("constraint_target", "metric"),
                 "benchmark_dataset": self.current_settings.get("benchmark_dataset", "mt_bench"),
-                "feasible_constraint_range_per_1m": self.feasible_constraint_range_per_1m,
-                "feasible_tps_range": self.feasible_tps_range,
                 "reference_tradeoff_curve_cs0_1": self.reference_tradeoff_curve_cs0_1,
-                "reference_tradeoff_curve_by_constraint": self.reference_tradeoff_curve_by_constraint,
                 "reference_cs_anchor_curve": self.reference_cs_anchor_curve,
-                "reference_constraint_anchor_curve": self.reference_constraint_anchor_curve,
                 "server_candidates": self.registry.list_servers(),
                 "probe_status": self.probe_status,
                 "server_probe_rows": self.probe_rows,

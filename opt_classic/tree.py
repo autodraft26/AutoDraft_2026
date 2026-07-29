@@ -44,10 +44,6 @@ class Tree:
         target_time_scale: float = 1.0,
         accept_length_scale: float = 1.0,
         accept_length_margin: float = 0.05,
-        objective_selection_mode: str = "blend",
-        constraint_target: str = "metric",
-        metric_constraint_per_token: float = None,
-        min_tps_constraint: float = None,
         opt_tree: bool = False,
         no_draft_cost: bool = False,
         stop_flag=None,
@@ -101,23 +97,6 @@ class Tree:
         self.target_per_sec_cost = target_per_sec_cost
         # Cost sensitivity weight in [0, 1].
         self.cost_sensitivity = cost_sensitivity
-        # Tree candidate selection mode: blend | constraint
-        self.objective_selection_mode = str(objective_selection_mode).lower() if objective_selection_mode is not None else "blend"
-        if self.objective_selection_mode not in {"blend", "constraint"}:
-            self.objective_selection_mode = "blend"
-        self.constraint_target = str(constraint_target).lower() if constraint_target is not None else "metric"
-        if self.constraint_target not in {"metric", "tps"}:
-            self.constraint_target = "metric"
-        self.metric_constraint_per_token = (
-            float(metric_constraint_per_token)
-            if metric_constraint_per_token is not None
-            else None
-        )
-        self.min_tps_constraint = (
-            float(min_tps_constraint)
-            if min_tps_constraint is not None and float(min_tps_constraint) > 0
-            else None
-        )
         self.reference_tps = float(reference_tps) if reference_tps is not None else 1.0
         self.reference_objective_per_token = (
             float(reference_objective_per_token)
@@ -209,17 +188,6 @@ class Tree:
             "interpolated_hit": 0,
             "nearest_hit": 0,
             "fallback": 0,
-        }
-        # constraint (fallback )
-        self.constraint_decision_stats = {
-            "width_candidate_feasible": 0,
-            "width_candidate_infeasible": 0,
-            "width_selected_feasible": 0,
-            "width_selected_fallback": 0,
-            "nnodes_candidate_feasible": 0,
-            "nnodes_candidate_infeasible": 0,
-            "nnodes_selected_feasible": 0,
-            "nnodes_selected_fallback": 0,
         }
         # target profile (nnodes -> avg_time_ms)
         self._target_profile_points = []
@@ -576,60 +544,6 @@ class Tree:
         alpha = self._sensitivity_alpha()
         return (alpha * normalized_cost) + ((1.0 - alpha) * normalized_tps)
 
-    def _constraint_objective(
-        self,
-        total_latency: float,
-        total_objective_cost: float,
-        denom_sum: float,
-        stage: str = None,
-    ) -> float:
-        """
-        Constraint mode objective:
-        - constraint_target == "metric":
-          metric_per_token <= metric_constraint_per_token among candidates where
-          minimize per_token_latency (=1/tps)
-          if no feasible candidate exists, minimize metric_per_token
-        - constraint_target == "tps":
-          current_tps >= min_tps_constraint among candidates where
-          minimize metric_per_token
-          if no feasible candidate exists, minimize per_token_latency (=1/tps)
-        """
-        if denom_sum <= 0 or total_latency <= 0:
-            return float("inf")
-        metric_per_token = float(total_objective_cost) / float(denom_sum)
-        per_token_latency = float(total_latency) / float(denom_sum)
-        current_tps = 1.0 / max(1e-9, per_token_latency)
-
-        if self.constraint_target == "tps":
-            feasible = not (
-                self.min_tps_constraint is not None
-                and self.min_tps_constraint > 0
-                and current_tps < float(self.min_tps_constraint)
-            )
-            feasible_objective = metric_per_token
-            fallback_objective = per_token_latency
-        else:
-            feasible = not (
-                self.metric_constraint_per_token is not None
-                and self.metric_constraint_per_token > 0
-                and metric_per_token > float(self.metric_constraint_per_token)
-            )
-            feasible_objective = per_token_latency
-            fallback_objective = metric_per_token
-
-        if feasible:
-            if stage == "width":
-                self.constraint_decision_stats["width_candidate_feasible"] += 1
-            elif stage == "nnodes":
-                self.constraint_decision_stats["nnodes_candidate_feasible"] += 1
-            return feasible_objective
-
-        if stage == "width":
-            self.constraint_decision_stats["width_candidate_infeasible"] += 1
-        elif stage == "nnodes":
-            self.constraint_decision_stats["nnodes_candidate_infeasible"] += 1
-        return 1e9 + fallback_objective
-
     def _discrete_width_candidates(self, valid_count: int):
         """Discrete width candidates same as add() (max_nnodes·filter by number of valid tokens)."""
         candidate_widths = list(range(10, 151, 10))
@@ -882,103 +796,38 @@ class Tree:
                 )
                 valid_mask = (denom_sum_tensor > 0) & (total_latency_tensor > 0)
 
-                if self.objective_selection_mode == "constraint":
-                    metric_per_token_tensor = torch.where(
-                        valid_mask,
-                        total_cost_tensor / denom_sum_tensor,
-                        torch.full_like(denom_sum_tensor, float("inf")),
-                    )
-                    per_token_latency_tensor = torch.where(
-                        valid_mask,
-                        total_latency_tensor / denom_sum_tensor,
-                        torch.full_like(denom_sum_tensor, float("inf")),
-                    )
-                    current_tps_tensor = torch.where(
-                        valid_mask,
-                        1.0 / torch.clamp(per_token_latency_tensor, min=1e-9),
-                        torch.zeros_like(per_token_latency_tensor),
-                    )
-
-                    if self.constraint_target == "tps":
-                        if self.min_tps_constraint is not None and self.min_tps_constraint > 0:
-                            feasible_mask = valid_mask & (
-                                current_tps_tensor >= float(self.min_tps_constraint)
-                            )
-                        else:
-                            feasible_mask = valid_mask
-                        objective_tensor = torch.where(
-                            feasible_mask,
-                            metric_per_token_tensor,
-                            torch.where(
-                                valid_mask,
-                                torch.full_like(per_token_latency_tensor, 1e9) + per_token_latency_tensor,
-                                torch.full_like(per_token_latency_tensor, float("inf")),
-                            ),
-                        )
-                    else:
-                        if self.metric_constraint_per_token is not None and self.metric_constraint_per_token > 0:
-                            feasible_mask = valid_mask & (
-                                metric_per_token_tensor <= float(self.metric_constraint_per_token)
-                            )
-                        else:
-                            feasible_mask = valid_mask
-                        objective_tensor = torch.where(
-                            feasible_mask,
-                            per_token_latency_tensor,
-                            torch.where(
-                                valid_mask,
-                                torch.full_like(metric_per_token_tensor, 1e9) + metric_per_token_tensor,
-                                torch.full_like(metric_per_token_tensor, float("inf")),
-                            ),
-                        )
-
-                    feasible_count = int(torch.sum(feasible_mask.to(torch.int32)).item())
-                    valid_count = int(torch.sum(valid_mask.to(torch.int32)).item())
-                    infeasible_count = max(0, valid_count - feasible_count)
-                    self.constraint_decision_stats["width_candidate_feasible"] += feasible_count
-                    self.constraint_decision_stats["width_candidate_infeasible"] += infeasible_count
-
-                    best_idx = int(torch.argmin(objective_tensor).item())
-                    best_objective = float(objective_tensor[best_idx].item())
-                    best_width = int(candidate_widths[best_idx])
-                else:
-                    current_tps_tensor = torch.where(
-                        valid_mask,
-                        denom_sum_tensor / total_latency_tensor,
-                        torch.zeros_like(denom_sum_tensor),
-                    )
-                    current_obj_per_token_tensor = torch.where(
-                        valid_mask,
-                        total_cost_tensor / denom_sum_tensor,
-                        torch.full_like(denom_sum_tensor, float("inf")),
-                    )
-                    ref_tps = max(1e-9, float(self.reference_tps))
-                    ref_obj = max(1e-12, float(self.reference_objective_per_token))
-                    normalized_tps_tensor = torch.where(
-                        current_tps_tensor > 0,
-                        torch.full_like(current_tps_tensor, float(ref_tps)) / current_tps_tensor,
-                        torch.full_like(current_tps_tensor, float("inf")),
-                    )
-                    normalized_cost_tensor = current_obj_per_token_tensor / float(ref_obj)
-                    alpha = float(self._sensitivity_alpha())
-                    objective_tensor = (alpha * normalized_cost_tensor) + ((1.0 - alpha) * normalized_tps_tensor)
-                    objective_tensor = torch.where(
-                        valid_mask,
-                        objective_tensor,
-                        torch.full_like(objective_tensor, float("inf")),
-                    )
-                    best_idx = int(torch.argmin(objective_tensor).item())
-                    best_objective = float(objective_tensor[best_idx].item())
-                    best_width = int(candidate_widths[best_idx])
+                current_tps_tensor = torch.where(
+                    valid_mask,
+                    denom_sum_tensor / total_latency_tensor,
+                    torch.zeros_like(denom_sum_tensor),
+                )
+                current_obj_per_token_tensor = torch.where(
+                    valid_mask,
+                    total_cost_tensor / denom_sum_tensor,
+                    torch.full_like(denom_sum_tensor, float("inf")),
+                )
+                ref_tps = max(1e-9, float(self.reference_tps))
+                ref_obj = max(1e-12, float(self.reference_objective_per_token))
+                normalized_tps_tensor = torch.where(
+                    current_tps_tensor > 0,
+                    torch.full_like(current_tps_tensor, float(ref_tps)) / current_tps_tensor,
+                    torch.full_like(current_tps_tensor, float("inf")),
+                )
+                normalized_cost_tensor = current_obj_per_token_tensor / float(ref_obj)
+                alpha = float(self._sensitivity_alpha())
+                objective_tensor = (alpha * normalized_cost_tensor) + ((1.0 - alpha) * normalized_tps_tensor)
+                objective_tensor = torch.where(
+                    valid_mask,
+                    objective_tensor,
+                    torch.full_like(objective_tensor, float("inf")),
+                )
+                best_idx = int(torch.argmin(objective_tensor).item())
+                best_objective = float(objective_tensor[best_idx].item())
+                best_width = int(candidate_widths[best_idx])
             
             # width
             width_algorithm_time = time.time() - width_algorithm_start_time
             self.width_algorithm_times.append(width_algorithm_time)
-            if self.objective_selection_mode == "constraint" and math.isfinite(best_objective):
-                if best_objective >= 1e9:
-                    self.constraint_decision_stats["width_selected_fallback"] += 1
-                else:
-                    self.constraint_decision_stats["width_selected_feasible"] += 1
             
             self.current_width = best_width
         
@@ -1216,179 +1065,113 @@ class Tree:
                 candidate_expected_sum,
                 torch.ones_like(candidate_expected_sum),
             )
-            if self.objective_selection_mode in {"constraint", "blend"}:
-                d2t_tokens_tensor = torch.tensor(
-                    candidate_nnodes_int,
-                    dtype=torch.float32,
-                    device=candidate_depth_probs.device,
-                )
-                denom_expected_tensor = (
-                    candidate_expected_sum
-                    * float(self.accept_length_scale)
-                    * max(0.0, 1.0 - float(self.accept_length_margin))
-                )
-                denom_sum_tensor = denom_expected_tensor + 1.0
-                target_time_list = [
-                    float(self._lookup_target_time_cached(nnodes=int(n), default_time=0.2))
-                    for n in candidate_nnodes_int
-                ]
-                target_time_tensor = torch.tensor(
-                    target_time_list,
-                    dtype=torch.float32,
-                    device=candidate_depth_probs.device,
-                )
-                transfer_time_tensor = (
-                    float(self.per_token_draft_to_target_transfer_time) * d2t_tokens_tensor
-                    + float(self.per_token_target_to_draft_transfer_time) * denom_sum_tensor
-                )
-                total_latency_tensor = (
-                    float(self.draft_total_time)
-                    + transfer_time_tensor
-                    + target_time_tensor
-                )
-                bytes_per_gb = float(1024 ** 3)
-                if self._uses_any_cost_objective() and bytes_per_gb > 0:
-                    d2t_bytes_tensor = d2t_tokens_tensor * float(self.per_token_draft_to_target_bytes)
-                    t2d_bytes_tensor = denom_sum_tensor * float(self.per_token_target_to_draft_bytes)
-                    inbound_cost_tensor = (
-                        d2t_bytes_tensor / bytes_per_gb
-                    ) * float(self.user_communication_cost_per_gb)
-                    user_outbound_cost_tensor = (
-                        t2d_bytes_tensor / bytes_per_gb
-                    ) * float(self.user_communication_cost_per_gb)
-                    cloud_outbound_cost_tensor = (
-                        t2d_bytes_tensor / bytes_per_gb
-                    ) * float(self.cloud_outbound_cost_per_gb)
-                    if self._uses_total_cost_objective():
-                        transfer_cost_tensor = torch.clamp(
-                            inbound_cost_tensor + user_outbound_cost_tensor + cloud_outbound_cost_tensor,
-                            min=0.0,
-                        )
-                    elif self._uses_api_cost_objective():
-                        transfer_cost_tensor = torch.clamp(
-                            user_outbound_cost_tensor + cloud_outbound_cost_tensor,
-                            min=0.0,
-                        )
-                    else:
-                        transfer_cost_tensor = torch.zeros_like(denom_sum_tensor)
+            d2t_tokens_tensor = torch.tensor(
+                candidate_nnodes_int,
+                dtype=torch.float32,
+                device=candidate_depth_probs.device,
+            )
+            denom_expected_tensor = (
+                candidate_expected_sum
+                * float(self.accept_length_scale)
+                * max(0.0, 1.0 - float(self.accept_length_margin))
+            )
+            denom_sum_tensor = denom_expected_tensor + 1.0
+            target_time_list = [
+                float(self._lookup_target_time_cached(nnodes=int(n), default_time=0.2))
+                for n in candidate_nnodes_int
+            ]
+            target_time_tensor = torch.tensor(
+                target_time_list,
+                dtype=torch.float32,
+                device=candidate_depth_probs.device,
+            )
+            transfer_time_tensor = (
+                float(self.per_token_draft_to_target_transfer_time) * d2t_tokens_tensor
+                + float(self.per_token_target_to_draft_transfer_time) * denom_sum_tensor
+            )
+            total_latency_tensor = (
+                float(self.draft_total_time)
+                + transfer_time_tensor
+                + target_time_tensor
+            )
+            bytes_per_gb = float(1024 ** 3)
+            if self._uses_any_cost_objective() and bytes_per_gb > 0:
+                d2t_bytes_tensor = d2t_tokens_tensor * float(self.per_token_draft_to_target_bytes)
+                t2d_bytes_tensor = denom_sum_tensor * float(self.per_token_target_to_draft_bytes)
+                inbound_cost_tensor = (
+                    d2t_bytes_tensor / bytes_per_gb
+                ) * float(self.user_communication_cost_per_gb)
+                user_outbound_cost_tensor = (
+                    t2d_bytes_tensor / bytes_per_gb
+                ) * float(self.user_communication_cost_per_gb)
+                cloud_outbound_cost_tensor = (
+                    t2d_bytes_tensor / bytes_per_gb
+                ) * float(self.cloud_outbound_cost_per_gb)
+                if self._uses_total_cost_objective():
+                    transfer_cost_tensor = torch.clamp(
+                        inbound_cost_tensor + user_outbound_cost_tensor + cloud_outbound_cost_tensor,
+                        min=0.0,
+                    )
+                elif self._uses_api_cost_objective():
+                    transfer_cost_tensor = torch.clamp(
+                        user_outbound_cost_tensor + cloud_outbound_cost_tensor,
+                        min=0.0,
+                    )
                 else:
                     transfer_cost_tensor = torch.zeros_like(denom_sum_tensor)
-
-                total_cost_tensor = (
-                    float(self.draft_total_time) * float(self._draft_objective_rate())
-                    + transfer_cost_tensor
-                    + target_time_tensor * float(self._target_objective_rate())
-                )
-                valid_mask = (denom_sum_tensor > 0) & (total_latency_tensor > 0)
-
-                if self.objective_selection_mode == "constraint":
-                    metric_per_token_tensor = torch.where(
-                        valid_mask,
-                        total_cost_tensor / denom_sum_tensor,
-                        torch.full_like(denom_sum_tensor, float("inf")),
-                    )
-                    per_token_latency_tensor = torch.where(
-                        valid_mask,
-                        total_latency_tensor / denom_sum_tensor,
-                        torch.full_like(denom_sum_tensor, float("inf")),
-                    )
-                    current_tps_tensor = torch.where(
-                        valid_mask,
-                        1.0 / torch.clamp(per_token_latency_tensor, min=1e-9),
-                        torch.zeros_like(per_token_latency_tensor),
-                    )
-
-                    if self.constraint_target == "tps":
-                        if self.min_tps_constraint is not None and self.min_tps_constraint > 0:
-                            feasible_mask = valid_mask & (
-                                current_tps_tensor >= float(self.min_tps_constraint)
-                            )
-                        else:
-                            feasible_mask = valid_mask
-                        objective_tensor = torch.where(
-                            feasible_mask,
-                            metric_per_token_tensor,
-                            torch.where(
-                                valid_mask,
-                                torch.full_like(per_token_latency_tensor, 1e9) + per_token_latency_tensor,
-                                torch.full_like(per_token_latency_tensor, float("inf")),
-                            ),
-                        )
-                    else:
-                        if self.metric_constraint_per_token is not None and self.metric_constraint_per_token > 0:
-                            feasible_mask = valid_mask & (
-                                metric_per_token_tensor <= float(self.metric_constraint_per_token)
-                            )
-                        else:
-                            feasible_mask = valid_mask
-                        objective_tensor = torch.where(
-                            feasible_mask,
-                            per_token_latency_tensor,
-                            torch.where(
-                                valid_mask,
-                                torch.full_like(metric_per_token_tensor, 1e9) + metric_per_token_tensor,
-                                torch.full_like(metric_per_token_tensor, float("inf")),
-                            ),
-                        )
-
-                    feasible_count = int(torch.sum(feasible_mask.to(torch.int32)).item())
-                    valid_count = int(torch.sum(valid_mask.to(torch.int32)).item())
-                    infeasible_count = max(0, valid_count - feasible_count)
-                    self.constraint_decision_stats["nnodes_candidate_feasible"] += feasible_count
-                    self.constraint_decision_stats["nnodes_candidate_infeasible"] += infeasible_count
-                else:
-                    current_tps_tensor = torch.where(
-                        valid_mask,
-                        denom_sum_tensor / total_latency_tensor,
-                        torch.zeros_like(denom_sum_tensor),
-                    )
-                    current_obj_per_token_tensor = torch.where(
-                        valid_mask,
-                        total_cost_tensor / denom_sum_tensor,
-                        torch.full_like(denom_sum_tensor, float("inf")),
-                    )
-                    ref_tps = max(1e-9, float(self.reference_tps))
-                    ref_obj = max(1e-12, float(self.reference_objective_per_token))
-                    normalized_tps_tensor = torch.where(
-                        current_tps_tensor > 0,
-                        torch.full_like(current_tps_tensor, float(ref_tps)) / current_tps_tensor,
-                        torch.full_like(current_tps_tensor, float("inf")),
-                    )
-                    normalized_cost_tensor = current_obj_per_token_tensor / float(ref_obj)
-                    alpha = float(self._sensitivity_alpha())
-                    objective_tensor = (alpha * normalized_cost_tensor) + ((1.0 - alpha) * normalized_tps_tensor)
-                    objective_tensor = torch.where(
-                        valid_mask,
-                        objective_tensor,
-                        torch.full_like(objective_tensor, float("inf")),
-                    )
-
-                best_idx = int(torch.argmin(objective_tensor).item())
-                best_final_nnodes = int(candidate_nnodes_int[best_idx])
-                best_top_index = top_index_all[:best_final_nnodes]
-                best_weight = top_weight_prefix[best_final_nnodes - 1]
-                best_objective_value = float(objective_tensor[best_idx].item())
-                best_sum_expected_accepted_length = float(candidate_expected_sum[best_idx].item())
-                best_current_target_time = float(target_time_tensor[best_idx].item())
-                best_denom_sum = float(denom_sum_tensor[best_idx].item())
-                best_total_latency = float(total_latency_tensor[best_idx].item())
-                best_total_cost = float(total_cost_tensor[best_idx].item())
-                best_per_token_latency = best_total_latency / max(1e-9, best_denom_sum)
-                best_per_token_cost = best_total_cost / max(1e-9, best_denom_sum)
-                candidate_expected_sum_by_nnodes = {}
             else:
-                for idx, n in enumerate(candidate_nnodes_int):
-                    candidate_expected_sum_by_nnodes[n] = float(candidate_expected_sum[idx].item())
+                transfer_cost_tensor = torch.zeros_like(denom_sum_tensor)
+
+            total_cost_tensor = (
+                float(self.draft_total_time) * float(self._draft_objective_rate())
+                + transfer_cost_tensor
+                + target_time_tensor * float(self._target_objective_rate())
+            )
+            valid_mask = (denom_sum_tensor > 0) & (total_latency_tensor > 0)
+
+            current_tps_tensor = torch.where(
+                valid_mask,
+                denom_sum_tensor / total_latency_tensor,
+                torch.zeros_like(denom_sum_tensor),
+            )
+            current_obj_per_token_tensor = torch.where(
+                valid_mask,
+                total_cost_tensor / denom_sum_tensor,
+                torch.full_like(denom_sum_tensor, float("inf")),
+            )
+            ref_tps = max(1e-9, float(self.reference_tps))
+            ref_obj = max(1e-12, float(self.reference_objective_per_token))
+            normalized_tps_tensor = torch.where(
+                current_tps_tensor > 0,
+                torch.full_like(current_tps_tensor, float(ref_tps)) / current_tps_tensor,
+                torch.full_like(current_tps_tensor, float("inf")),
+            )
+            normalized_cost_tensor = current_obj_per_token_tensor / float(ref_obj)
+            alpha = float(self._sensitivity_alpha())
+            objective_tensor = (alpha * normalized_cost_tensor) + ((1.0 - alpha) * normalized_tps_tensor)
+            objective_tensor = torch.where(
+                valid_mask,
+                objective_tensor,
+                torch.full_like(objective_tensor, float("inf")),
+            )
+
+            best_idx = int(torch.argmin(objective_tensor).item())
+            best_final_nnodes = int(candidate_nnodes_int[best_idx])
+            best_top_index = top_index_all[:best_final_nnodes]
+            best_weight = top_weight_prefix[best_final_nnodes - 1]
+            best_objective_value = float(objective_tensor[best_idx].item())
+            best_sum_expected_accepted_length = float(candidate_expected_sum[best_idx].item())
+            best_current_target_time = float(target_time_tensor[best_idx].item())
+            best_denom_sum = float(denom_sum_tensor[best_idx].item())
+            best_total_latency = float(total_latency_tensor[best_idx].item())
+            best_total_cost = float(total_cost_tensor[best_idx].item())
+            best_per_token_latency = best_total_latency / max(1e-9, best_denom_sum)
+            best_per_token_cost = best_total_cost / max(1e-9, best_denom_sum)
+            candidate_expected_sum_by_nnodes = {}
         
         # final_nnodes
         nnodes_algorithm_time = time.time() - nnodes_algorithm_start_time
         self.nnodes_algorithm_times.append(nnodes_algorithm_time)
-        if self.objective_selection_mode == "constraint" and math.isfinite(best_objective_value):
-            if best_objective_value >= 1e9:
-                self.constraint_decision_stats["nnodes_selected_fallback"] += 1
-            else:
-                self.constraint_decision_stats["nnodes_selected_feasible"] += 1
-        
         # best_top_index None 
         if best_top_index is None:
             # , topk

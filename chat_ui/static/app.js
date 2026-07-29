@@ -32,17 +32,7 @@ const jumpParetoBtn = document.getElementById("jumpParetoBtn");
 const jumpFastestBtn = document.getElementById("jumpFastestBtn");
 const costSlider = document.getElementById("costSlider");
 const costValue = document.getElementById("costValue");
-const constraintSlider = document.getElementById("constraintSlider");
-const constraintValue = document.getElementById("constraintValue");
-const constraintHint = document.getElementById("constraintHint");
 const costControlGroup = document.getElementById("costControlGroup");
-const constraintTargetSelect = document.getElementById("constraintTargetSelect");
-const constraintTargetControlGroup = document.getElementById("constraintTargetControlGroup");
-const constraintControlGroup = document.getElementById("constraintControlGroup");
-const tpsConstraintSlider = document.getElementById("tpsConstraintSlider");
-const tpsConstraintValue = document.getElementById("tpsConstraintValue");
-const tpsConstraintHint = document.getElementById("tpsConstraintHint");
-const tpsConstraintControlGroup = document.getElementById("tpsConstraintControlGroup");
 const maxTokensInput = document.getElementById("maxTokensInput");
 const algorithmSelect = document.getElementById("algorithmSelect");
 const draftModelSelect = document.getElementById("draftModelSelect");
@@ -83,12 +73,7 @@ let controlsLocked = false;
 let tokenColoringEnabled = false;
 let streamingAiBubble = null;
 let lastTreeStats = null;
-let feasibleConstraintMin = null;
-let feasibleConstraintMax = null;
-let feasibleTpsMin = null;
-let feasibleTpsMax = null;
 let tradeoffCurveBlend = null;
-let tradeoffCurveConstraint = null;
 let serverCandidates = [];
 let serverCatalogSignature = "";
 let serverProbeRows = [];
@@ -211,11 +196,6 @@ const HOW_TO_USE_HTML = `
 
 function resetTradeoffViewAfterStop() {
   tradeoffCurveBlend = null;
-  tradeoffCurveConstraint = null;
-  feasibleConstraintMin = null;
-  feasibleConstraintMax = null;
-  feasibleTpsMin = null;
-  feasibleTpsMax = null;
   serverProbeRows = [];
   serverProbeCurves = [];
   recommendationSummary = {
@@ -226,7 +206,6 @@ function resetTradeoffViewAfterStop() {
   tradeoffHoverPointUid = null;
   recommendationHoverKind = null;
   tradeoffDisplayMode = "reference";
-  updateConstraintSliderVisual();
   updateRecommendationHint();
   drawTradeoffChart();
 }
@@ -250,7 +229,7 @@ function getUiHelpText(mode) {
       "[Benchmark Mode]",
       "- Use Start/Stop to run or stop benchmark sessions.",
       "- Shutdown Target fully terminates the remote autodraft_target server process.",
-      "- Compare trade-offs by changing objective mode and sliders.",
+      "- Compare trade-offs by changing the Cost Sensitivity slider.",
       "- Rebuild the local reference trade-off with Profile LLM.",
       "- Check runtime status by typing status or /status.",
       "",
@@ -742,22 +721,9 @@ function jumpToRecommendation(kind) {
     if (serverModelSelect) serverModelSelect.value = String(mid);
     renderServerDropdown();
   }
-  if (targetPoint && Number.isFinite(Number(targetPoint.selector))) {
-    const objectiveMode = (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "balanced";
-    if (objectiveMode === "constraint") {
-      if (getConstraintTarget() === "tps" && tpsConstraintSlider) {
-        tpsConstraintSlider.value = String(targetPoint.selector);
-        if (tpsConstraintValue) tpsConstraintValue.textContent = Number(tpsConstraintSlider.value).toFixed(1);
-        updateTpsConstraintHint();
-      } else if (constraintSlider) {
-        constraintSlider.value = String(targetPoint.selector);
-        clampConstraintToFeasible();
-        if (constraintValue) constraintValue.textContent = Number(constraintSlider.value).toFixed(1);
-      }
-    } else if (costSlider) {
-      costSlider.value = String(Number(targetPoint.selector).toFixed(2));
-      if (costValue) costValue.textContent = Number(costSlider.value).toFixed(2);
-    }
+  if (targetPoint && Number.isFinite(Number(targetPoint.selector)) && costSlider) {
+    costSlider.value = String(Number(targetPoint.selector).toFixed(2));
+    if (costValue) costValue.textContent = Number(costSlider.value).toFixed(2);
   }
 
   drawTradeoffChart();
@@ -824,18 +790,7 @@ function getRecommendationHoverUids() {
 }
 
 function getCurrentSelectorValue() {
-  const objectiveMode = (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "balanced";
-  if (objectiveMode === "constraint") {
-    const constraintTarget = (constraintTargetSelect && constraintTargetSelect.value === "tps") ? "tps" : "metric";
-    return constraintTarget === "tps"
-      ? Number(tpsConstraintSlider ? tpsConstraintSlider.value : 0)
-      : Number(constraintSlider ? constraintSlider.value : 0);
-  }
   return Number(costSlider ? costSlider.value : 0);
-}
-
-function getConstraintTarget() {
-  return (constraintTargetSelect && constraintTargetSelect.value === "tps") ? "tps" : "metric";
 }
 
 function computeReferenceRecommendations(points) {
@@ -905,32 +860,22 @@ function updateControlsState() {
   const algo = algorithmSelect.value;
   const isObjectiveAlgo = algo === "AutoDraft" || algo === "Server-Only" || algo === "Server-Only-AR";
   const allowsProactive = algo === "AutoDraft";
-  if (!isObjectiveAlgo && objectiveModeSelect) {
+  if (objectiveModeSelect) {
     objectiveModeSelect.value = "balanced";
   }
-  const objectiveMode = (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "balanced";
-  const constraintTarget = getConstraintTarget();
-  
+
   modeSelect.disabled = controlsLocked;
-  objectiveModeSelect.disabled = controlsLocked || !isObjectiveAlgo;
+  if (objectiveModeSelect) {
+    objectiveModeSelect.disabled = controlsLocked || !isObjectiveAlgo;
+  }
   algorithmSelect.disabled = controlsLocked;
   draftModelSelect.disabled = controlsLocked;
-  if (constraintTargetSelect) constraintTargetSelect.disabled = !isObjectiveAlgo || objectiveMode !== "constraint";
 
-  // cost/proactive/constraintcan be adjusted in real time during a session
-  costSlider.disabled = !isObjectiveAlgo || objectiveMode === "constraint";
-  if (constraintSlider) constraintSlider.disabled = !isObjectiveAlgo || objectiveMode !== "constraint" || constraintTarget !== "metric";
-  if (tpsConstraintSlider) tpsConstraintSlider.disabled = !isObjectiveAlgo || objectiveMode !== "constraint" || constraintTarget !== "tps";
+  // cost/proactive can be adjusted in real time during a session
+  costSlider.disabled = !isObjectiveAlgo;
   proactiveDrafting.disabled = !allowsProactive;
-  const showConstraint = isObjectiveAlgo && objectiveMode === "constraint";
-  if (costControlGroup) costControlGroup.style.display = showConstraint ? "none" : "";
-  if (constraintTargetControlGroup) constraintTargetControlGroup.style.display = showConstraint ? "" : "none";
-  if (constraintControlGroup) constraintControlGroup.style.display = showConstraint && constraintTarget === "metric" ? "" : "none";
-  if (tpsConstraintControlGroup) tpsConstraintControlGroup.style.display = showConstraint && constraintTarget === "tps" ? "" : "none";
-  updateConstraintHint();
-  updateTpsConstraintHint();
-  updateConstraintSliderVisual();
-  
+  if (costControlGroup) costControlGroup.style.display = "";
+
   // Cost Sensitivity section (title and slider row)
   const costTitle = costSlider.closest(".side-panel")?.querySelector(".panel-title");
   const costSliderRow = costSlider.closest(".slider-row");
@@ -975,79 +920,8 @@ function updateControlsState() {
   drawTradeoffChart();
 }
 
-function updateConstraintHint() {
-  if (!constraintHint) return;
-  if (getConstraintTarget() !== "metric") {
-    constraintHint.textContent = "Choose Metric Budget to activate this constraint.";
-    return;
-  }
-  const hasFeasible =
-    Number.isFinite(feasibleConstraintMin) &&
-    Number.isFinite(feasibleConstraintMax) &&
-    feasibleConstraintMin <= feasibleConstraintMax;
-  if (!hasFeasible) {
-    constraintHint.textContent = "Feasible range unavailable. Run/refresh reference cache first.";
-    return;
-  }
-  constraintHint.textContent = `Feasible range: ${feasibleConstraintMin.toFixed(2)} ~ ${feasibleConstraintMax.toFixed(2)} ($/1M tok)`;
-}
-
-function updateTpsConstraintHint() {
-  if (!tpsConstraintHint || !tpsConstraintSlider) return;
-  if (getConstraintTarget() !== "tps") {
-    tpsConstraintHint.textContent = "Choose Minimum Throughput to activate this constraint.";
-    return;
-  }
-  const minTps = Number(tpsConstraintSlider.value || 0);
-  const hasFeasible =
-    Number.isFinite(feasibleTpsMin) &&
-    Number.isFinite(feasibleTpsMax) &&
-    feasibleTpsMin <= feasibleTpsMax;
-  const suffix = hasFeasible
-    ? ` Feasible range: ${feasibleTpsMin.toFixed(1)} ~ ${feasibleTpsMax.toFixed(1)} tok/s.`
-    : "";
-  tpsConstraintHint.textContent = minTps > 0
-    ? `Candidates with predicted throughput below ${minTps.toFixed(1)} tok/s are treated as infeasible.${suffix}`
-    : `0 disables the TPS floor.${suffix}`;
-}
-
-function updateConstraintSliderVisual() {
-  if (!constraintSlider) return;
-  if (getConstraintTarget() !== "metric") {
-    constraintSlider.style.background = "";
-    return;
-  }
-  const sliderMin = Number(constraintSlider.min || 1);
-  const sliderMax = Number(constraintSlider.max || 30);
-  const hasFeasible =
-    Number.isFinite(feasibleConstraintMin) &&
-    Number.isFinite(feasibleConstraintMax) &&
-    feasibleConstraintMin <= feasibleConstraintMax;
-  if (!hasFeasible) {
-    constraintSlider.style.background = "";
-    updateConstraintHint();
-    return;
-  }
-  const leftPct = Math.max(0, Math.min(100, ((feasibleConstraintMin - sliderMin) / (sliderMax - sliderMin)) * 100));
-  const rightPct = Math.max(0, Math.min(100, ((feasibleConstraintMax - sliderMin) / (sliderMax - sliderMin)) * 100));
-  constraintSlider.style.background = `linear-gradient(to right, #d1d5db 0%, #d1d5db ${leftPct}%, #9cc0f0 ${leftPct}%, #9cc0f0 ${rightPct}%, #d1d5db ${rightPct}%, #d1d5db 100%)`;
-  updateConstraintHint();
-}
-
-function clampConstraintToFeasible() {
-  if (!constraintSlider) return;
-  if (getConstraintTarget() !== "metric") return;
-  if (!Number.isFinite(feasibleConstraintMin) || !Number.isFinite(feasibleConstraintMax)) return;
-  let v = Number(constraintSlider.value);
-  if (!Number.isFinite(v)) return;
-  v = Math.max(feasibleConstraintMin, Math.min(feasibleConstraintMax, v));
-  constraintSlider.value = String(v);
-  if (constraintValue) constraintValue.textContent = Number(v).toFixed(1);
-}
-
 function getActiveTradeoffPoints() {
-  const objectiveMode = (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "balanced";
-  const sourceRef = objectiveMode === "constraint" ? tradeoffCurveConstraint : tradeoffCurveBlend;
+  const sourceRef = tradeoffCurveBlend;
   const selectorNow = getCurrentSelectorValue();
 
   const probePoints = (Array.isArray(serverProbeRows) && serverProbeRows.length)
@@ -1248,10 +1122,7 @@ function drawTradeoffChart() {
     ctx.stroke();
   }
 
-  const objectiveMode = (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "balanced";
-  const currentSelector = objectiveMode === "constraint"
-    ? getCurrentSelectorValue()
-    : Number(costSlider ? costSlider.value : 0);
+  const currentSelector = Number(costSlider ? costSlider.value : 0);
   let bestIdx = 0;
   let bestDist = Number.POSITIVE_INFINITY;
   sorted.forEach((p, i) => {
@@ -1349,16 +1220,8 @@ function drawTradeoffChart() {
     ctx.stroke();
     ctx.restore();
 
-    const objectiveMode = (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "balanced";
-    const hoverMode = String(hovered && hovered.source) === "probe_curve"
-      ? String(serverProbeCurveMode || "cost_sensitivity")
-      : (objectiveMode === "constraint" ? "constraint" : "cost_sensitivity");
     const selectorLabel = Number.isFinite(Number(hovered.selector))
-      ? (hoverMode === "constraint"
-        ? (getConstraintTarget() === "tps"
-          ? `min-tps: ${Number(hovered.selector).toFixed(2)}`
-          : `metric-budget: ${Number(hovered.selector).toFixed(2)}`)
-        : `cost-sensitivity: ${Number(hovered.selector).toFixed(2)}`)
+      ? `cost-sensitivity: ${Number(hovered.selector).toFixed(2)}`
       : "cost-sensitivity: -";
     const valueLabel = `cost: ${hovered.x.toFixed(2)} | throughput: ${hovered.y.toFixed(2)}`;
     ctx.fillStyle = "#6b7280";
@@ -1803,10 +1666,6 @@ function sendSettings() {
     cost: parseFloat(costSlider.value),
     max_new_tokens: maxNewTokens,
     metric_preference: metricPreferenceSelect ? metricPreferenceSelect.value : "total_cost",
-    constraint_target: getConstraintTarget(),
-    metric_constraint_per_1m_token: constraintSlider ? parseFloat(constraintSlider.value) : 14.0,
-    min_tps_constraint: tpsConstraintSlider ? parseFloat(tpsConstraintSlider.value) : 0.0,
-    objective_selection_mode: (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "blend",
     algorithm: algorithmSelect.value,
     draft_model_path: draftModelSelect.value,
     benchmark_dataset: benchmarkDatasetSelect ? benchmarkDatasetSelect.value : "mt_bench",
@@ -1974,10 +1833,6 @@ function sendChat() {
     cost: parseFloat(costSlider.value),
     max_new_tokens: maxNewTokens,
     metric_preference: metricPreferenceSelect ? metricPreferenceSelect.value : "total_cost",
-    constraint_target: getConstraintTarget(),
-    metric_constraint_per_1m_token: constraintSlider ? parseFloat(constraintSlider.value) : 14.0,
-    min_tps_constraint: tpsConstraintSlider ? parseFloat(tpsConstraintSlider.value) : 0.0,
-    objective_selection_mode: (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "blend",
     algorithm: algorithmSelect.value,
     benchmark_dataset: benchmarkDatasetSelect ? benchmarkDatasetSelect.value : "mt_bench",
     proactive_drafting: proactiveDrafting.checked,
@@ -2059,27 +1914,6 @@ ws.addEventListener("message", (ev) => {
           tps: Number(r.predicted_tps),
           selector_value: Number(r.cost_sensitivity),
         }));
-      }
-      if (Array.isArray(msg.reference_tradeoff_curve_by_constraint)) {
-        tradeoffCurveConstraint = msg.reference_tradeoff_curve_by_constraint.map((r) => ({
-          cost_per_1m: Number(r.predicted_metric_per_1m_token),
-          tps: Number(r.predicted_tps),
-          selector_value: Number(
-            getConstraintTarget() === "tps"
-              ? (r.min_tps_constraint !== undefined ? r.min_tps_constraint : r.predicted_tps)
-              : r.metric_constraint_per_1m_token
-          ),
-        }));
-      }
-      const fr = msg.feasible_constraint_range_per_1m;
-      if (fr && Number.isFinite(Number(fr.min)) && Number.isFinite(Number(fr.max))) {
-        feasibleConstraintMin = Number(fr.min);
-        feasibleConstraintMax = Number(fr.max);
-      }
-      const ft = msg.feasible_tps_range;
-      if (ft && Number.isFinite(Number(ft.min)) && Number.isFinite(Number(ft.max))) {
-        feasibleTpsMin = Number(ft.min);
-        feasibleTpsMax = Number(ft.max);
       }
       if (!streamingAiBubble) {
         const b = appendBubble("ai", finalReply, finalTrace);
@@ -2256,26 +2090,7 @@ ws.addEventListener("message", (ev) => {
       if (benchmarkDatasetSelect && typeof msg.benchmark_dataset === "string") {
         benchmarkDatasetSelect.value = msg.benchmark_dataset;
       }
-      if (constraintTargetSelect && typeof msg.constraint_target === "string") {
-        constraintTargetSelect.value = (msg.constraint_target === "tps") ? "tps" : "metric";
-      }
-      if (constraintSlider && msg.metric_constraint_per_1m_token !== undefined && msg.metric_constraint_per_1m_token !== null) {
-        const metricBudget = Number(msg.metric_constraint_per_1m_token);
-        if (Number.isFinite(metricBudget)) {
-          constraintSlider.value = String(metricBudget);
-          if (constraintValue) constraintValue.textContent = metricBudget.toFixed(1);
-        }
-      }
-      if (tpsConstraintSlider && msg.min_tps_constraint !== undefined && msg.min_tps_constraint !== null) {
-        const minTps = Number(msg.min_tps_constraint);
-        if (Number.isFinite(minTps)) {
-          tpsConstraintSlider.value = String(minTps);
-          if (tpsConstraintValue) tpsConstraintValue.textContent = minTps.toFixed(1);
-          updateTpsConstraintHint();
-        }
-      }
       updateRecommendationHint();
-      const constraintTarget = getConstraintTarget();
       if (Array.isArray(msg.reference_tradeoff_curve_cs0_1)) {
         tradeoffCurveBlend = msg.reference_tradeoff_curve_cs0_1.map((r) => ({
           cost_per_1m: Number(r.predicted_metric_per_1m_token),
@@ -2283,51 +2098,6 @@ ws.addEventListener("message", (ev) => {
           selector_value: Number(r.cost_sensitivity),
         }));
       }
-      if (Array.isArray(msg.reference_tradeoff_curve_by_constraint)) {
-        tradeoffCurveConstraint = msg.reference_tradeoff_curve_by_constraint.map((r) => ({
-          cost_per_1m: Number(r.predicted_metric_per_1m_token),
-          tps: Number(r.predicted_tps),
-          selector_value: Number(
-            constraintTarget === "tps"
-              ? (r.min_tps_constraint !== undefined ? r.min_tps_constraint : r.predicted_tps)
-              : r.metric_constraint_per_1m_token
-          ),
-        }));
-      } else if (Array.isArray(msg.reference_constraint_anchor_curve)) {
-        // Fallback for older/newer caches without interpolated constraint trade-off curve
-        tradeoffCurveConstraint = msg.reference_constraint_anchor_curve.map((r) => ({
-          cost_per_1m: Number(
-            r.predicted_metric_per_1m_token !== undefined
-              ? r.predicted_metric_per_1m_token
-              : r.predicted_objective_per_1m_token
-          ),
-          tps: Number(r.predicted_tps),
-          selector_value: Number(
-            constraintTarget === "tps"
-              ? (r.min_tps_constraint !== undefined ? r.min_tps_constraint : r.predicted_tps)
-              : r.metric_constraint_per_1m_token
-          ),
-        }));
-      }
-      const fr = msg.feasible_constraint_range_per_1m;
-      if (fr && Number.isFinite(Number(fr.min)) && Number.isFinite(Number(fr.max))) {
-        feasibleConstraintMin = Number(fr.min);
-        feasibleConstraintMax = Number(fr.max);
-      } else if (fr === null) {
-        feasibleConstraintMin = null;
-        feasibleConstraintMax = null;
-      }
-      const ft = msg.feasible_tps_range;
-      if (ft && Number.isFinite(Number(ft.min)) && Number.isFinite(Number(ft.max))) {
-        feasibleTpsMin = Number(ft.min);
-        feasibleTpsMax = Number(ft.max);
-      } else if (ft === null) {
-        feasibleTpsMin = null;
-        feasibleTpsMax = null;
-      }
-      clampConstraintToFeasible();
-      updateTpsConstraintHint();
-      updateConstraintSliderVisual();
       drawTradeoffChart();
       // Update stats data
       const isChat = modeSelect.value === "chat";
@@ -2423,41 +2193,16 @@ if (tradeoffCanvas) {
       syncServerModelSelect(best.model_id);
       if (serverModelSelect) serverModelSelect.value = String(best.model_id);
       renderServerDropdown();
-      if (Number.isFinite(Number(best.selector))) {
-        if (serverProbeCurveMode === "constraint") {
-          if (getConstraintTarget() === "tps" && tpsConstraintSlider) {
-            tpsConstraintSlider.value = String(best.selector);
-            if (tpsConstraintValue) tpsConstraintValue.textContent = Number(tpsConstraintSlider.value).toFixed(1);
-            updateTpsConstraintHint();
-          } else if (constraintSlider) {
-            constraintSlider.value = String(best.selector);
-            clampConstraintToFeasible();
-            if (constraintValue) constraintValue.textContent = Number(constraintSlider.value).toFixed(1);
-          }
-        } else if (costSlider) {
-          costSlider.value = String(Number(best.selector).toFixed(2));
-          if (costValue) costValue.textContent = Number(costSlider.value).toFixed(2);
-        }
+      if (Number.isFinite(Number(best.selector)) && costSlider) {
+        costSlider.value = String(Number(best.selector).toFixed(2));
+        if (costValue) costValue.textContent = Number(costSlider.value).toFixed(2);
       }
       drawTradeoffChart();
       if (ws.readyState === WebSocket.OPEN) sendSettings();
       return;
     }
-    const objectiveMode = (objectiveModeSelect && objectiveModeSelect.value === "constraint") ? "constraint" : "balanced";
-    if (objectiveMode === "constraint") {
-      if (getConstraintTarget() === "tps" && tpsConstraintSlider) {
-        tpsConstraintSlider.value = String(best.selector);
-        if (tpsConstraintValue) tpsConstraintValue.textContent = Number(tpsConstraintSlider.value).toFixed(1);
-        updateTpsConstraintHint();
-      } else if (constraintSlider) {
-        constraintSlider.value = String(best.selector);
-        clampConstraintToFeasible();
-        constraintValue.textContent = Number(constraintSlider.value).toFixed(1);
-      }
-    } else {
-      costSlider.value = String(Number(best.selector).toFixed(2));
-      costValue.textContent = Number(costSlider.value).toFixed(2);
-    }
+    costSlider.value = String(Number(best.selector).toFixed(2));
+    costValue.textContent = Number(costSlider.value).toFixed(2);
     drawTradeoffChart();
     if (ws.readyState === WebSocket.OPEN) sendSettings();
   });
@@ -2494,45 +2239,6 @@ costSlider.addEventListener("input", () => {
     if (ws.readyState === WebSocket.OPEN) sendSettings();
   }
 });
-if (constraintSlider) {
-  constraintSlider.addEventListener("input", () => {
-    if (!constraintSlider.disabled) {
-      clampConstraintToFeasible();
-      constraintValue.textContent = Number(constraintSlider.value).toFixed(1);
-      drawTradeoffChart();
-      if (ws.readyState === WebSocket.OPEN) sendSettings();
-    }
-  });
-  constraintSlider.addEventListener("change", () => {
-    if (!constraintSlider.disabled && ws.readyState === WebSocket.OPEN) {
-      clampConstraintToFeasible();
-      sendSettings();
-    }
-  });
-}
-if (constraintTargetSelect) {
-  constraintTargetSelect.addEventListener("change", () => {
-    tradeoffCurveConstraint = null;
-    updateControlsState();
-    drawTradeoffChart();
-    if (ws.readyState === WebSocket.OPEN) sendSettings();
-  });
-}
-if (tpsConstraintSlider) {
-  tpsConstraintSlider.addEventListener("input", () => {
-    if (!tpsConstraintSlider.disabled) {
-      if (tpsConstraintValue) tpsConstraintValue.textContent = Number(tpsConstraintSlider.value).toFixed(1);
-      updateTpsConstraintHint();
-      if (ws.readyState === WebSocket.OPEN) sendSettings();
-    }
-  });
-  tpsConstraintSlider.addEventListener("change", () => {
-    if (!tpsConstraintSlider.disabled && ws.readyState === WebSocket.OPEN) {
-      updateTpsConstraintHint();
-      sendSettings();
-    }
-  });
-}
 costSlider.addEventListener("change", () => {
   if (!costSlider.disabled && ws.readyState === WebSocket.OPEN) {
     sendSettings();
