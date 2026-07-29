@@ -1,7 +1,7 @@
 # *AutoDraft*: Automatic Cost-Performance Adaptation in User-Cloud Distributed Speculative Decoding
 
 ---
-This repository is the official implementation of "AutoDraft: Automatic Cost-Performance Adaptation in User-Cloud Distributed Speculative Decoding," submitted to NeurIPS 2026.
+This repository is the official implementation of "AutoDraft: Automatic Cost-Performance Adaptation in User-Cloud Distributed Speculative Decoding," submitted to INFOCOM 2027.
 
 ## Abstract
 
