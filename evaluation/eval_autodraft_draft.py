@@ -1892,11 +1892,17 @@ def profile_width_timing(
                 for depth in range(1, max_depth + 1):
                     if tree_output.get("is_final", False):
                         break
-                    
-                    # update (model_time )
-                    # model.model() logits[0] (batch_size, prev_width, vocab_size)
-                    logits_for_update = logits.unsqueeze(0) if logits.dim() == 2 else logits  # (prev_width, vocab_size) -> (1, prev_width, vocab_size)
-                    tree_output = tree.update(torch.softmax(logits_for_update.to(last_hidden.device), dim=-1, dtype=torch.float32), print_tree=False, tokenizer=tokenizer, draft_time=draft_time)
+
+                    # ``tree_output`` already contains the first-depth tokens
+                    # returned by initialize(). Profile those before expanding
+                    # the tree, matching DraftRunner.draft(). Expanding here on
+                    # depth 1 skips those tokens and makes the mask assume that
+                    # ``width`` parent KV entries already exist. Short prompts
+                    # then fail once width exceeds the prompt length.
+                    if depth > 1:
+                        # model.model() logits[0] (batch_size, prev_width, vocab_size)
+                        logits_for_update = logits.unsqueeze(0) if logits.dim() == 2 else logits  # (prev_width, vocab_size) -> (1, prev_width, vocab_size)
+                        tree_output = tree.update(torch.softmax(logits_for_update.to(last_hidden.device), dim=-1, dtype=torch.float32), print_tree=False, tokenizer=tokenizer, draft_time=draft_time)
                     input_ids_step = tree_output["input_ids"].unsqueeze(0)
                     position_ids = tree_output["position_ids"] + len_posi   # [DH] index -> index ( input_ids )
                     if tree_output.get("is_final", False):
@@ -10714,5 +10720,4 @@ if __name__ == "__main__":
                     fout.write(answers[qid])
         
         reorg_answer_file(args.answer_file)
-
 
