@@ -429,12 +429,27 @@ class Qwen2PreTrainedModel(PreTrainedModel):
     def _init_weights(self, module):
         std = self.config.initializer_range
         if isinstance(module, nn.Linear):
-            if module.weight.is_floating_point():
+            # transformers >=5 marks checkpoint-loaded parameters individually.
+            # Respect that marker: direct ``Tensor.normal_``/``zero_`` calls do
+            # not have the guard used by transformers.initialization and would
+            # otherwise overwrite the fp16 embedding/lm_head left unquantized
+            # by bitsandbytes.
+            if (
+                module.weight.is_floating_point()
+                and not getattr(module.weight, "_is_hf_initialized", False)
+            ):
                 module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None and module.bias.is_floating_point():
+            if (
+                module.bias is not None
+                and module.bias.is_floating_point()
+                and not getattr(module.bias, "_is_hf_initialized", False)
+            ):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
-            if module.weight.is_floating_point():
+            if (
+                module.weight.is_floating_point()
+                and not getattr(module.weight, "_is_hf_initialized", False)
+            ):
                 module.weight.data.normal_(mean=0.0, std=std)
                 if module.padding_idx is not None:
                     module.weight.data[module.padding_idx].zero_()
