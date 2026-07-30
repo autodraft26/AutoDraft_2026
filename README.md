@@ -139,11 +139,14 @@ source .venv/bin/activate
 ```
 
 If neither `HF_TOKEN` nor `HUGGING_FACE_HUB_TOKEN` is set, `run_target.sh`
-prompts for a Hugging Face token before starting the server. The input is
-hidden and is exported only to the server process and its children. Press
-Enter without typing a token to continue with public or already-cached models.
-For unattended startup, set `HF_TOKEN` in the environment or in the repository
-root `.env` file instead.
+first checks the Hugging Face user credential store and reuses its active token.
+If no saved token exists, the script prompts securely and saves the entered
+token for future runs (normally in `~/.cache/huggingface/token`). Press Enter
+without typing a token to continue with public or already-cached models. You can
+also authenticate in advance with `hf auth login`. For unattended startup,
+`HF_TOKEN` may be supplied through the environment or the repository root
+`.env` file; an environment value takes precedence over the saved token. Never
+commit `.env` or a token file to Git.
 
 Wait until you see the server log indicating that it is listening on the port (lazy-load mode means no model is loaded yet — that happens when the user side connects).
 

@@ -11,7 +11,8 @@ fi
 
 # Usage:
 #   ./run_target.sh
-#   # When HF_TOKEN is not set, an interactive terminal prompts for it securely.
+#   # When no token is configured or saved, an interactive terminal prompts for
+#   # it securely and saves it in the Hugging Face user credential store.
 #   TARGET_HOST=127.0.0.1 TARGET_PORT=26001 BASE_MODEL_PATH=meta-llama/Llama-3.3-70B-Instruct ./run_target.sh
 #   ./run_target.sh --host 127.0.0.1 --port 26001 --base-model-path meta-llama/Llama-3.3-70B-Instruct --draft-model-path meta-llama/Llama-3.2-3B-Instruct
 
@@ -45,18 +46,31 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Ask for Hugging Face credentials only when neither supported environment
-# variable was supplied (including through .env). Silent input keeps the token
-# out of shell history and the process command line. A blank value is allowed
-# for public models and already-cached gated models.
+# Resolve Hugging Face credentials in this order:
+#   1. HF_TOKEN / HUGGING_FACE_HUB_TOKEN (including through .env)
+#   2. The Hugging Face user credential store (normally ~/.cache/huggingface/token)
+#   3. A secure interactive prompt
+# Silent input keeps the token out of shell history and the process command
+# line. A blank value is allowed for public models and already-cached gated
+# models.
 HF_TOKEN_VALUE="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+HF_TOKEN_SOURCE="environment"
+
 if [[ -z "$HF_TOKEN_VALUE" ]]; then
+  HF_TOKEN_VALUE="$(python3 -c 'from huggingface_hub import get_token; print(get_token() or "")' 2>/dev/null || true)"
+  if [[ -n "$HF_TOKEN_VALUE" ]]; then
+    HF_TOKEN_SOURCE="credential-store"
+  fi
+fi
+
+if [[ -z "$HF_TOKEN_VALUE" ]]; then
+  HF_TOKEN_SOURCE="prompt"
   if [[ -t 0 ]]; then
-    printf "Hugging Face token (input hidden; press Enter to continue without one): " >&2
+    printf "Hugging Face token (input hidden; saved for future runs; press Enter to continue without one): " >&2
     IFS= read -r -s HF_TOKEN_VALUE
     printf "\n" >&2
   else
-    echo "HF_TOKEN is not set and no interactive terminal is available; continuing without a Hugging Face token." >&2
+    echo "No Hugging Face token is configured or saved and no interactive terminal is available; continuing without one." >&2
   fi
 fi
 
@@ -65,9 +79,22 @@ if [[ -n "$HF_TOKEN_VALUE" ]]; then
   # Keep compatibility with code and huggingface_hub versions using the
   # legacy variable name.
   export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN_VALUE"
+
+  if [[ "$HF_TOKEN_SOURCE" == "prompt" ]]; then
+    if python3 -c 'import os; from huggingface_hub import login; login(token=os.environ["HF_TOKEN"], add_to_git_credential=False, skip_if_logged_in=False)' >/dev/null; then
+      echo "Hugging Face token saved in the user credential store and configured for this server process."
+    else
+      echo "Warning: could not save the Hugging Face token; it is configured for this server process only." >&2
+    fi
+  elif [[ "$HF_TOKEN_SOURCE" == "credential-store" ]]; then
+    echo "Using the Hugging Face token saved for this user."
+  else
+    echo "Hugging Face token configured from the environment for this server process."
+  fi
+
   unset HF_TOKEN_VALUE
-  echo "Hugging Face token configured for this server process."
 fi
+unset HF_TOKEN_SOURCE
 
 for i in $(seq 1 "$RUNS"); do
   echo "===== target run $i / $RUNS ====="
