@@ -11,6 +11,7 @@ fi
 
 # Usage:
 #   ./run_target.sh
+#   # When HF_TOKEN is not set, an interactive terminal prompts for it securely.
 #   TARGET_HOST=127.0.0.1 TARGET_PORT=26001 BASE_MODEL_PATH=meta-llama/Llama-3.3-70B-Instruct ./run_target.sh
 #   ./run_target.sh --host 127.0.0.1 --port 26001 --base-model-path meta-llama/Llama-3.3-70B-Instruct --draft-model-path meta-llama/Llama-3.2-3B-Instruct
 
@@ -43,6 +44,30 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown argument: $1"; exit 1 ;;
   esac
 done
+
+# Ask for Hugging Face credentials only when neither supported environment
+# variable was supplied (including through .env). Silent input keeps the token
+# out of shell history and the process command line. A blank value is allowed
+# for public models and already-cached gated models.
+HF_TOKEN_VALUE="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+if [[ -z "$HF_TOKEN_VALUE" ]]; then
+  if [[ -t 0 ]]; then
+    printf "Hugging Face token (input hidden; press Enter to continue without one): " >&2
+    IFS= read -r -s HF_TOKEN_VALUE
+    printf "\n" >&2
+  else
+    echo "HF_TOKEN is not set and no interactive terminal is available; continuing without a Hugging Face token." >&2
+  fi
+fi
+
+if [[ -n "$HF_TOKEN_VALUE" ]]; then
+  export HF_TOKEN="$HF_TOKEN_VALUE"
+  # Keep compatibility with code and huggingface_hub versions using the
+  # legacy variable name.
+  export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN_VALUE"
+  unset HF_TOKEN_VALUE
+  echo "Hugging Face token configured for this server process."
+fi
 
 for i in $(seq 1 "$RUNS"); do
   echo "===== target run $i / $RUNS ====="
